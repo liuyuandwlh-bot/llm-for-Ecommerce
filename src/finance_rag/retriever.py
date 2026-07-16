@@ -5,16 +5,21 @@ Based on recommended plan:
 - BM25 + Dense + Reciprocal Rank Fusion (RRF)
 - Metadata filtering (company, year, document type)
 - FAISS for dense vectors
+
+Fixed issues:
+- Dense retriever index attribute naming conflict
+- Device auto detection
+- Vector zero norm protection
+- Proper persistence and recovery
 """
 
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Union
 import json
 import numpy as np
 from pathlib import Path
 
-from sentence_transformers import SentenceTransformer
-import faiss
+import torch
 
 
 @dataclass
@@ -34,7 +39,7 @@ class RetrievalQuery:
     """A retrieval query."""
     query_id: str
     text: str
-    filters: Dict = None  # Metadata filters
+    filters: Optional[Dict] = None
 
 
 class BM25Retriever:
@@ -43,12 +48,9 @@ class BM25Retriever:
     def __init__(self, k1: float = 1.5, b: float = 0.75):
         self.k1 = k1
         self.b = b
-        self.doc_freq = {}  # Document frequency for each term
-        self.doc_lengths = []
-        self.avgdl = 0
-        self.doc_count = 0
-        self.corpus = []  # List of (chunk_id, text)
-        self.tokenized_corpus = []
+        self.corpus: List[Tuple[str, str]] = []  # List of (chunk_id, text)
+        self.tokenized_corpus: List[List[str]] = []
+        self._bm25 = None
 
     def index(self, chunks: List[dict]):
         """Build BM25 index."""
@@ -57,7 +59,7 @@ class BM25Retriever:
         self.corpus = [(c["chunk_id"], c["text"]) for c in chunks]
         self.tokenized_corpus = [self._tokenize(text) for _, text in self.corpus]
 
-        self.bm25 = BM25Okapi(self.tokenized_corpus)
+        self._bm25 = BM25Okapi(self.tokenized_corpus)
         self.doc_count = len(self.corpus)
 
         print(f"BM25 indexed {self.doc_count} documents")
@@ -73,8 +75,11 @@ class BM25Retriever:
         top_k: int = 50,
     ) -> List[Tuple[str, float]]:
         """Search BM25 index."""
+        if self._bm25 is None:
+            return []
+        
         query_tokens = self._tokenize(query)
-        scores = self.bm25.get_scores(query_tokens)
+        scores = self._bm25.get_scores(query_tokens)
 
         # Get top-k
         top_indices = np.argsort(scores)[::-1][:top_k]
@@ -86,7 +91,11 @@ class BM25Retriever:
 
 
 class DenseRetriever:
-    """Dense vector retriever using sentence transformers."""
+    """
+    Dense vector retriever using sentence transformers.
+    
+    Fixed: renamed index attribute to faiss_index to avoid method name conflict.
+    """
 
     def __init__(
         self,
@@ -95,18 +104,38 @@ class DenseRetriever:
         batch_size: int = 32,
     ):
         self.model_name = model_name
-        self.device = device
+        
+        # Resolve device
+        if device == "auto":
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            self.device = device
+        
         self.batch_size = batch_size
+        self._model = None
+        self.faiss_index = None  # Renamed to avoid conflict with index() method
+        self.chunks: List[dict] = []
+        self.id_to_idx: Dict[str, int] = {}
 
-        print(f"Loading embedding model: {model_name}")
-        self.model = SentenceTransformer(model_name, device=device)
+    def _load_model(self):
+        """Lazy load the embedding model."""
+        if self._model is None:
+            from sentence_transformers import SentenceTransformer
+            print(f"Loading embedding model: {self.model_name} on {self.device}")
+            self._model = SentenceTransformer(self.model_name, device=self.device)
 
-        self.index = None
-        self.chunks = []  # List of chunk dicts
-        self.id_to_idx = {}
+    @property
+    def model(self):
+        """Lazy load model property."""
+        self._load_model()
+        return self._model
 
-    def index(self, chunks: List[dict], batch_size: Optional[int] = None):
-        """Build dense index."""
+    def build_index(self, chunks: List[dict], batch_size: Optional[int] = None):
+        """
+        Build dense index.
+        
+        Renamed from index() to avoid attribute conflict.
+        """
         self.chunks = chunks
         self.id_to_idx = {c["chunk_id"]: i for i, c in enumerate(chunks)}
 
@@ -125,12 +154,24 @@ class DenseRetriever:
         # Normalize
         embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
 
+        # Check for zero vectors
+        norms = np.linalg.norm(embeddings, axis=1)
+        if np.any(norms == 0):
+            print("Warning: Found zero norm vectors, setting to small random values")
+            zero_mask = norms == 0
+            embeddings[zero_mask] = np.random.randn(sum(zero_mask), embeddings.shape[1]) * 0.01
+            embeddings[zero_mask] = embeddings[zero_mask] / np.linalg.norm(embeddings[zero_mask], axis=1, keepdims=True)
+
         # Build FAISS index
         dimension = embeddings.shape[1]
-        self.index = faiss.IndexFlatIP(dimension)
-        self.index.add(embeddings.astype(np.float32))
+        self.faiss_index = faiss.IndexFlatIP(dimension)
+        self.faiss_index.add(embeddings.astype(np.float32))
 
-        print(f"Dense index built with {self.index.ntotal} vectors")
+        print(f"Dense index built with {self.faiss_index.ntotal} vectors")
+
+    def index(self, chunks: List[dict], batch_size: Optional[int] = None):
+        """Alias for build_index for backward compatibility."""
+        return self.build_index(chunks, batch_size)
 
     def search(
         self,
@@ -138,15 +179,22 @@ class DenseRetriever:
         top_k: int = 50,
     ) -> List[Tuple[str, float]]:
         """Search dense index."""
+        if self.faiss_index is None:
+            return []
+        
         query_embedding = self.model.encode([query], convert_to_numpy=True)
         query_embedding = query_embedding / np.linalg.norm(query_embedding, axis=1, keepdims=True)
 
-        scores, indices = self.index.search(query_embedding.astype(np.float32), top_k)
+        # Check for zero query vector
+        if np.linalg.norm(query_embedding) == 0:
+            query_embedding = np.ones_like(query_embedding) / np.sqrt(query_embedding.shape[1])
+
+        scores, indices = self.faiss_index.search(query_embedding.astype(np.float32), top_k)
 
         return [
             (self.chunks[i]["chunk_id"], float(scores[0][j]))
             for j, i in enumerate(indices[0])
-            if i >= 0
+            if i >= 0 and i < len(self.chunks)
         ]
 
 
@@ -170,10 +218,10 @@ class HybridRetriever:
         self.dense = DenseRetriever(model_name=embedding_model, device=device)
         self.rrf_k = rrf_k
 
-        self.chunks = []  # For text lookup
-        self.chunk_map = {}
+        self.chunks: List[dict] = []
+        self.chunk_map: Dict[str, dict] = {}
 
-    def index(self, chunks: List[dict]):
+    def build_index(self, chunks: List[dict]):
         """Build both BM25 and dense indexes."""
         self.chunks = chunks
         self.chunk_map = {c["chunk_id"]: c for c in chunks}
@@ -184,9 +232,13 @@ class HybridRetriever:
 
         # Dense
         print("Building dense index...")
-        self.dense.index(chunks)
+        self.dense.build_index(chunks)
 
         print(f"Hybrid index built: {len(chunks)} chunks")
+
+    def index(self, chunks: List[dict]):
+        """Alias for build_index for backward compatibility."""
+        return self.build_index(chunks)
 
     def search(
         self,
@@ -246,9 +298,9 @@ class HybridRetriever:
             results.append(RetrievalResult(
                 chunk_id=chunk_id,
                 text=chunk["text"],
-                doc_id=chunk["doc_id"],
-                page_start=chunk["page_start"],
-                page_end=chunk["page_end"],
+                doc_id=chunk.get("doc_id", ""),
+                page_start=chunk.get("page_start", 0),
+                page_end=chunk.get("page_end", 0),
                 score=rrf_score,
                 source="+".join(source),
             ))
@@ -261,11 +313,14 @@ class HybridRetriever:
     def _passes_filters(self, chunk: dict, filters: Dict) -> bool:
         """Check if chunk passes metadata filters."""
         for key, value in filters.items():
-            if key not in chunk.get("metadata", {}):
-                if key not in ["doc_id", "page_start", "page_end"]:
-                    continue
-
-            chunk_value = chunk.get(key) or chunk.get("metadata", {}).get(key)
+            # Check in both chunk and metadata
+            if key in chunk:
+                chunk_value = chunk.get(key)
+            elif "metadata" in chunk and key in chunk["metadata"]:
+                chunk_value = chunk["metadata"].get(key)
+            else:
+                # Filter key not found in chunk
+                return False  # Fail closed
 
             if isinstance(value, list):
                 if chunk_value not in value:
@@ -277,30 +332,53 @@ class HybridRetriever:
 
     def save_index(self, output_path: str):
         """Save index to disk."""
+        import faiss
+
+        output_dir = Path(output_path).parent
+        output_dir.mkdir(parents=True, exist_ok=True)
+
         # Save chunk map
-        chunk_map_path = Path(output_path).parent / "chunk_map.json"
+        chunk_map_path = output_dir / "chunk_map.json"
         with open(chunk_map_path, 'w', encoding='utf-8') as f:
             json.dump(self.chunk_map, f, ensure_ascii=False)
 
         # Save FAISS index
-        faiss_path = Path(output_path).parent / "dense.index"
-        if self.dense.index is not None:
-            faiss.write_index(self.dense.index, str(faiss_path))
+        faiss_path = output_dir / "dense.index"
+        if self.dense.faiss_index is not None:
+            faiss.write_index(self.dense.faiss_index, str(faiss_path))
 
-        print(f"Index saved to {output_path}")
+        # Save id mapping
+        id_map = {"id_to_idx": self.dense.id_to_idx}
+        id_map_path = output_dir / "id_map.json"
+        with open(id_map_path, 'w') as f:
+            json.dump(id_map, f)
 
-    def load_index(self, index_path: str, chunk_map_path: str):
+        print(f"Index saved to {output_dir}")
+
+    def load_index(self, index_dir: str):
         """Load index from disk."""
+        import faiss
+
+        index_dir = Path(index_dir)
+
         # Load chunk map
+        chunk_map_path = index_dir / "chunk_map.json"
         with open(chunk_map_path, 'r', encoding='utf-8') as f:
             self.chunk_map = json.load(f)
 
         self.chunks = list(self.chunk_map.values())
 
         # Load FAISS index
-        faiss_path = Path(chunk_map_path).parent / "dense.index"
+        faiss_path = index_dir / "dense.index"
         if faiss_path.exists():
-            self.dense.index = faiss.read_index(str(faiss_path))
+            self.dense.faiss_index = faiss.read_index(str(faiss_path))
+
+        # Load id mapping
+        id_map_path = index_dir / "id_map.json"
+        if id_map_path.exists():
+            with open(id_map_path, 'r') as f:
+                id_map = json.load(f)
+                self.dense.id_to_idx = id_map.get("id_to_idx", {})
 
         # Rebuild BM25
         self.bm25.index(self.chunks)
@@ -322,7 +400,7 @@ def build_retriever(
 
     # Build retriever
     retriever = HybridRetriever(embedding_model=embedding_model)
-    retriever.index(chunks)
+    retriever.build_index(chunks)
 
     # Save if path provided
     if output_path:
@@ -331,5 +409,15 @@ def build_retriever(
     return retriever
 
 
+# Lazy import faiss
+faiss = None
+def _get_faiss():
+    global faiss
+    if faiss is None:
+        import faiss
+    return faiss
+
+
 if __name__ == "__main__":
     print("Hybrid Retriever Module")
+    print("Usage: build_retriever(chunks_path, embedding_model)")

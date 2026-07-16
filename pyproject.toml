@@ -1,6 +1,6 @@
 [project]
 name = "llm-portfolio-platform"
-version = "0.1.0"
+version = "0.2.0"
 description = "LLM Full-Stack Portfolio: E-commerce Customer Service + Financial RAG"
 authors = [{name = "Portfolio Author", email = "portfolio@example.com"}]
 readme = "README.md"
@@ -16,39 +16,30 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 
+# Core dependencies - minimal set for basic functionality
 dependencies = [
-    # Core ML
-    "torch>=2.0.0",
-    "transformers>=4.40.0",
-    "peft>=0.10.0",
-    "trl>=0.8.0",
-    "accelerate>=0.28.0",
-    "bitsandbytes>=0.41.0",
-    # RAG
-    "faiss-cpu>=1.7.4",
-    "faiss-gpu>=1.7.4",
-    "qdrant-client>=1.7.0",
-    "sentence-transformers>=2.3.0",
-    "rank_bm25>=0.2.2",
-    # PDF Processing
-    "pdfplumber>=0.10.3",
-    "pymupdf>=1.23.0",
-    "paddleocr>=2.7.0",
-    "docling>=1.0.0",
+    # Core ML (optional, for training)
+    # "torch>=2.0.0",
+    # "transformers>=4.40.0",
+    # "peft>=0.10.0",
+    # "trl>=0.8.0",
+    # "accelerate>=0.28.0",
+    # "bitsandbytes>=0.41.0",
+    # "datasets>=2.14.0",
+    # RAG (optional)
+    # "faiss-cpu>=1.7.4",  # OR faiss-gpu, not both
+    # "sentence-transformers>=2.3.0",
+    # "rank-bm25>=0.2.2",
+    # PDF Processing (optional)
+    # "pdfplumber>=0.10.3",
+    # "pymupdf>=1.23.0",
     # API & Web
     "fastapi>=0.110.0",
     "uvicorn>=0.27.0",
     "httpx>=0.27.0",
-    "sse-starlette>=2.0.0",
     # Data
     "pandas>=2.0.0",
     "numpy>=1.24.0",
-    "pyarrow>=14.0.0",
-    # Evaluation
-    "rouge-score>=0.1.2",
-    "bert-score>=0.3.13",
-    "langchain>=0.1.0",
-    "ragas>=0.1.0",
     # Utils
     "pyyaml>=6.0",
     "pydantic>=2.0.0",
@@ -59,11 +50,39 @@ dependencies = [
     # Testing
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
-    "pytest-cov>=4.1.0",
-    "httpx>=0.27.0",  # For TestClient
 ]
 
 [project.optional-dependencies]
+# Training dependencies
+train = [
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+    "peft>=0.10.0",
+    "trl>=0.8.0",
+    "accelerate>=0.28.0",
+    "bitsandbytes>=0.41.0",
+    "datasets>=2.14.0",
+    "sentencepiece>=0.1.99",
+]
+# RAG dependencies
+rag = [
+    "faiss-cpu>=1.7.4",
+    "sentence-transformers>=2.3.0",
+    "rank-bm25>=0.2.2",
+    "pdfplumber>=0.10.3",
+    "pymupdf>=1.23.0",
+    "jieba>=0.42.1",
+]
+# GPU RAG (alternative to CPU)
+rag-gpu = [
+    "faiss-gpu>=1.7.4",
+    "sentence-transformers>=2.3.0",
+    "rank-bm25>=0.2.2",
+    "pdfplumber>=0.10.3",
+    "pymupdf>=1.23.0",
+    "jieba>=0.42.1",
+]
+# Development dependencies
 dev = [
     "black>=24.0.0",
     "isort>=5.13.0",
@@ -72,17 +91,21 @@ dev = [
     "pre-commit>=3.6.0",
     "jupyter>=1.0.0",
     "ipykernel>=6.28.0",
+    "pytest-cov>=4.1.0",
 ]
+# All optional dependencies
+all = [
+    "llm-portfolio-platform[train,rag,dev]",
+]
+# DVC for data versioning
 dvc = [
     "dvc>=3.0.0",
     "dvc-gdrive>=2.0.0",
 ]
+# MLflow for experiment tracking
 mlflow = [
     "mlflow>=2.12.0",
     "optuna>=3.5.0",
-]
-all = [
-    "llm-portfolio-platform[dev,dvc,mlflow]",
 ]
 
 [project.scripts]
@@ -134,6 +157,8 @@ asyncio_mode = "auto"
 filterwarnings = [
     "ignore::DeprecationWarning",
 ]
+# Don't require all optional deps for basic tests
+addopts = "-p no:optional"
 
 [tool.coverage.run]
 source = ["src"]

@@ -1,326 +1,441 @@
 """
 SFT Training Script using TRL + PEFT
 
-Based on the recommended project plan (推荐项目_全面实施规划.md):
-- Model: Qwen3-4B-Instruct-2507
-- Method: QLoRA
-- Baseline order: Prompt-only → RAG-only → SFT → SFT+RAG → SFT+DPO
+Supports both Qwen and Llama models with proper chat template handling.
 """
 
 import os
 import sys
 import json
 import argparse
+import logging
 from pathlib import Path
-from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List, Dict
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from trl import SFTTrainer
-from transformers import TrainingArguments, DataCollatorForCompletionLM
+from transformers import DataCollatorForCompletionLM
+
+from .sft_config import SFTConfig, MODEL_MATRIX
 
 
-@dataclass
-class SFTConfig:
-    """SFT training configuration."""
-    # Model
-    model_name: str = "Qwen/Qwen3-4B-Instruct-2507"
-    model_revision: str = "cdbee75f17c01a7cc42f958dc650907174af0554"
-    trust_remote_code: bool = True
-
-    # Quantization (QLoRA)
-    load_in_4bit: bool = True
-    bnb_4bit_compute_dtype: str = "bfloat16"
-    bnb_4bit_quant_type: str = "nf4"
-    bnb_4bit_use_double_quant: bool = True
-
-    # LoRA
-    lora_r: int = 16
-    lora_alpha: int = 32
-    lora_dropout: float = 0.05
-    lora_target_modules: str = "all-linear"  # Will be set after loading model
-
-    # Training
-    num_train_epochs: int = 2
-    per_device_train_batch_size: int = 2
-    gradient_accumulation_steps: int = 8
-    learning_rate: float = 2e-4
-    warmup_ratio: float = 0.05
-    weight_decay: float = 0.01
-    max_grad_norm: float = 1.0
-    max_seq_length: int = 1536
-    packing: bool = False
-
-    # Evaluation
-    eval_strategy: str = "steps"
-    eval_steps: int = 100
-    save_strategy: str = "steps"
-    save_steps: int = 100
-    save_total_limit: int = 3
-    load_best_model_at_end: bool = True
-    metric_for_best_model: str = "eval_loss"
-
-    # Logging
-    logging_steps: int = 10
-    report_to: str = "tensorboard"
-
-    # Output
-    output_dir: str = "output/sft_qlora"
-    run_name: Optional[str] = None
-
-    # Hardware
-    gradient_checkpointing: bool = True
-    bf16: bool = True
-    seed: int = 42
+logger = logging.getLogger(__name__)
 
 
-def format_conversation(example):
-    """Format conversation into ChatML format."""
-    system_prompt = """你是一个专业、热情的3C电子产品店客服，很乐意帮助用户解决问题。
-重要原则：
-1. 只依据给出的政策信息回答，不要编造
-2. 缺少订单信息时先澄清，不要猜测
-3. 不确定时建议转人工
-4. 保持礼貌和专业"""
+def format_conversation_qwen(messages: List[Dict], tokenizer) -> str:
+    """Format conversation using Qwen chat template."""
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    return text
 
+
+def format_conversation_llama(messages: List[Dict], tokenizer) -> str:
+    """Format conversation using Llama chat template."""
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    return text
+
+
+def format_conversation(
+    example: Dict, 
+    tokenizer,
+    chat_template: str = "qwen"
+) -> Dict:
+    """Format conversation into model-specific format."""
     messages = example.get("messages", [])
-
-    # Build text in ChatML format
-    text = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-
-    for msg in messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        text += f"<|im_start|>{role}\n{content}<|im_end|>\n"
-
+    
+    if chat_template == "llama":
+        text = format_conversation_llama(messages, tokenizer)
+    else:
+        text = format_conversation_qwen(messages, tokenizer)
+    
     return {"text": text}
 
 
-def load_conversation_dataset(data_path: str, max_samples: Optional[int] = None):
-    """Load conversation dataset from JSONL."""
+def load_conversation_dataset(
+    data_path: str, 
+    tokenizer,
+    chat_template: str = "qwen",
+    max_samples: Optional[int] = None
+) -> Dataset:
+    """Load conversation dataset from JSONL and format."""
     data = []
     with open(data_path, 'r', encoding='utf-8') as f:
         for line in f:
             data.append(json.loads(line))
-
+    
     if max_samples:
         data = data[:max_samples]
+    
+    dataset = Dataset.from_list(data)
+    
+    # Format with appropriate template
+    def format_fn(example):
+        return format_conversation(example, tokenizer, chat_template)
+    
+    return dataset.map(format_fn, remove_columns=dataset.column_names)
 
-    from datasets import Dataset
-    return Dataset.from_list(data).map(format_conversation)
 
-
-def get_target_modules(model):
+def get_target_modules(model, chat_template: str = "qwen") -> List[str]:
     """Get target modules for LoRA based on model architecture."""
-    # Common target modules for different model families
     target_modules = set()
-
+    
     for name, module in model.named_modules():
         # Qwen models
-        if any(x in name for x in ["q_proj", "k_proj", "v_proj", "o_proj"]):
+        if "q_proj" in name or "k_proj" in name or "v_proj" in name or "o_proj" in name:
             parts = name.split(".")
             target_modules.add(parts[-1] if parts else name)
-
-    # Default to common attention modules
+    
+    # Llama models have different module names
+    if chat_template == "llama":
+        for name, module in model.named_modules():
+            if any(x in name for x in ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]):
+                parts = name.split(".")
+                target_modules.add(parts[-1] if parts else name)
+    
+    # Default if no matches
     if not target_modules:
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
-
+    
     return list(target_modules)
 
 
+def get_model_chat_template(model_name: str) -> str:
+    """Determine chat template from model name."""
+    if "llama" in model_name.lower():
+        return "llama"
+    elif "qwen" in model_name.lower():
+        return "qwen"
+    else:
+        return "qwen"  # Default
+
+
 class CustomerServiceSFTTrainer:
-    """SFT Trainer for customer service model."""
+    """
+    SFT Trainer for customer service model.
+    
+    Supports both Qwen and Llama models with proper template handling.
+    """
 
     def __init__(self, config: SFTConfig):
         self.config = config
         self.model = None
         self.tokenizer = None
         self.trainer = None
+        
+        # Determine chat template
+        self.chat_template = config.model.chat_template or get_model_chat_template(config.model.name)
 
-    def setup_model(self):
-        """Initialize model and tokenizer."""
-        print(f"Loading model: {self.config.model_name}")
-        print(f"Revision: {self.config.model_revision}")
-
-        # Load tokenizer
+    def setup_tokenizer(self):
+        """Initialize tokenizer with proper settings."""
+        print(f"Loading tokenizer: {self.config.model.name}")
+        
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.config.model_name,
-            revision=self.config.model_revision,
-            trust_remote_code=self.config.trust_remote_code,
+            self.config.model.name,
+            revision=self.config.model.revision,
+            trust_remote_code=self.config.model.trust_remote_code,
             padding_side="right",
         )
-        self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        # Ensure pad token exists
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        print(f"Chat template: {self.chat_template}")
+        return self.tokenizer
 
-        # Load model with quantization
+    def setup_model(self):
+        """Initialize model with appropriate quantization/LoRA settings."""
+        print(f"Loading model: {self.config.model.name}")
+        print(f"Revision: {self.config.model.revision}")
+        
+        # Setup tokenizer first
+        if self.tokenizer is None:
+            self.setup_tokenizer()
+        
+        # Quantization config
         from transformers import BitsAndBytesConfig
-
         quantization_config = None
-        if self.config.load_in_4bit:
+        
+        if self.config.quantization.enabled and self.config.quantization.load_in_4bit:
             quantization_config = BitsAndBytesConfig(
                 load_in_4bit=True,
-                bnb_4bit_compute_dtype=getattr(torch, self.config.bnb_4bit_compute_dtype),
-                bnb_4bit_quant_type=self.config.bnb_4bit_quant_type,
-                bnb_4bit_use_double_quant=self.config.bnb_4bit_use_double_quant,
+                bnb_4bit_compute_dtype=getattr(
+                    torch, 
+                    self.config.quantization.bnb_4bit_compute_dtype,
+                    torch.bfloat16
+                ),
+                bnb_4bit_quant_type=self.config.quantization.bnb_4bit_quant_type,
+                bnb_4bit_use_double_quant=self.config.quantization.bnb_4bit_use_double_quant,
             )
-
+        
+        # Load model
+        torch_dtype = torch.bfloat16 if self.config.hardware.bf16 else torch.float16
+        
         self.model = AutoModelForCausalLM.from_pretrained(
-            self.config.model_name,
-            revision=self.config.model_revision,
+            self.config.model.name,
+            revision=self.config.model.revision,
             quantization_config=quantization_config,
             device_map="auto",
-            trust_remote_code=self.config.trust_remote_code,
-            torch_dtype=getattr(torch, self.config.bnb_4bit_compute_dtype),
+            trust_remote_code=self.config.model.trust_remote_code,
+            torch_dtype=torch_dtype,
         )
-
-        # Prepare for kbit training
-        if self.config.load_in_4bit:
+        
+        # Prepare for kbit training if quantized
+        if self.config.quantization.enabled:
             self.model = prepare_model_for_kbit_training(self.model)
-
+        
         # Get target modules and setup LoRA
-        target_modules = get_target_modules(self.model)
+        target_modules_str = self.config.lora.target_modules
+        
+        # Parse target modules
+        if target_modules_str == "all-linear":
+            target_modules = get_target_modules(self.model, self.chat_template)
+        elif target_modules_str == "all":
+            target_modules = "all-linear"
+        else:
+            target_modules = [m.strip() for m in target_modules_str.split(",")]
+        
         print(f"Target modules: {target_modules}")
-
+        
         lora_config = LoraConfig(
-            r=self.config.lora_r,
-            lora_alpha=self.config.lora_alpha,
-            lora_dropout=self.config.lora_dropout,
+            r=self.config.lora.r,
+            lora_alpha=self.config.lora.alpha,
+            lora_dropout=self.config.lora.dropout,
             target_modules=target_modules,
-            bias="none",
+            bias=self.config.lora.bias,
             task_type="CAUSAL_LM",
         )
-
+        
         self.model = get_peft_model(self.model, lora_config)
         self.model.print_trainable_parameters()
-
+        
         return self.model, self.tokenizer
 
     def setup_trainer(self, train_dataset, eval_dataset=None):
-        """Setup SFTTrainer."""
+        """Setup SFTTrainer with proper collator."""
+        # Create output directory
+        Path(self.config.output.output_dir).mkdir(parents=True, exist_ok=True)
+        
+        # Training arguments
         training_args = TrainingArguments(
-            output_dir=self.config.output_dir,
-            num_train_epochs=self.config.num_train_epochs,
-            per_device_train_batch_size=self.config.per_device_train_batch_size,
-            gradient_accumulation_steps=self.config.gradient_accumulation_steps,
-            learning_rate=self.config.learning_rate,
-            warmup_ratio=self.config.warmup_ratio,
-            weight_decay=self.config.weight_decay,
-            max_grad_norm=self.config.max_grad_norm,
+            output_dir=self.config.output.output_dir,
+            num_train_epochs=self.config.training.num_train_epochs,
+            per_device_train_batch_size=self.config.training.per_device_train_batch_size,
+            gradient_accumulation_steps=self.config.training.gradient_accumulation_steps,
+            learning_rate=self.config.training.learning_rate,
+            warmup_ratio=self.config.training.warmup_ratio,
+            weight_decay=self.config.training.weight_decay,
+            max_grad_norm=self.config.training.max_grad_norm,
             max_steps=-1,
-            gradient_checkpointing=self.config.gradient_checkpointing,
-            bf16=self.config.bf16,
-            fp16=False,
-            evaluation_strategy=self.config.eval_strategy,
-            eval_steps=self.config.eval_steps if eval_dataset else None,
-            save_strategy=self.config.save_strategy,
-            save_steps=self.config.save_steps,
-            save_total_limit=self.config.save_total_limit,
-            load_best_model_at_end=self.config.load_best_model_at_end,
-            metric_for_best_model=self.config.metric_for_best_model,
-            logging_steps=self.config.logging_steps,
-            report_to=self.config.report_to,
-            seed=self.config.seed,
+            gradient_checkpointing=self.config.hardware.gradient_checkpointing,
+            bf16=self.config.hardware.bf16,
+            fp16=self.config.hardware.fp16,
+            evaluation_strategy=self.config.evaluation.eval_strategy,
+            eval_steps=self.config.evaluation.eval_steps if eval_dataset else None,
+            save_strategy=self.config.evaluation.save_strategy,
+            save_steps=self.config.evaluation.save_steps,
+            save_total_limit=self.config.evaluation.save_total_limit,
+            load_best_model_at_end=self.config.evaluation.load_best_model_at_end,
+            metric_for_best_model=self.config.evaluation.metric_for_best_model,
+            logging_steps=10,
+            report_to="tensorboard",
+            seed=self.config.hardware.seed,
             remove_unused_columns=False,
+            dataloader_num_workers=self.config.hardware.dataloader_num_workers,
         )
-
+        
         # Data collator for completion modeling
-        def response_template(tokenizer):
-            return "<|im_start|>assistant\n"
-
+        # Use model-specific template
+        if self.chat_template == "llama":
+            response_template = "<|eot_id|>"  # Llama 3 special token
+        else:
+            response_template = "<|im_start|>assistant\n"
+        
         data_collator = DataCollatorForCompletionLM(
-            response_template=response_template(self.tokenizer),
+            response_template=response_template,
             tokenizer=self.tokenizer,
             mlm=False,
         )
-
+        
         self.trainer = SFTTrainer(
             model=self.model,
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             tokenizer=self.tokenizer,
-            max_seq_length=self.config.max_seq_length,
+            max_seq_length=self.config.training.max_seq_length,
             data_collator=data_collator,
         )
-
+        
         return self.trainer
 
-    def train(self, train_data_path: str, eval_data_path: str = None):
+    def train(
+        self, 
+        train_data_path: str, 
+        eval_data_path: Optional[str] = None
+    ):
         """Run training."""
-        print("Setting up model...")
+        print("=" * 60)
+        print("SFT Training Configuration")
+        print("=" * 60)
+        print(f"Model: {self.config.model.name}")
+        print(f"Chat Template: {self.chat_template}")
+        print(f"Output: {self.config.output.output_dir}")
+        print("=" * 60)
+        
+        # Setup model
         self.setup_model()
-
-        print(f"Loading training data from: {train_data_path}")
-        train_dataset = load_conversation_dataset(train_data_path)
-
+        
+        # Load data
+        print(f"\nLoading training data: {train_data_path}")
+        train_dataset = load_conversation_dataset(
+            train_data_path,
+            self.tokenizer,
+            self.chat_template,
+            self.config.data.max_samples,
+        )
+        
         eval_dataset = None
-        if eval_data_path:
-            print(f"Loading evaluation data from: {eval_data_path}")
-            eval_dataset = load_conversation_dataset(eval_data_path)
-
+        if eval_data_path and Path(eval_data_path).exists():
+            print(f"Loading evaluation data: {eval_data_path}")
+            eval_dataset = load_conversation_dataset(
+                eval_data_path,
+                self.tokenizer,
+                self.chat_template,
+                self.config.data.max_samples,
+            )
+        
         print(f"Training samples: {len(train_dataset)}")
         if eval_dataset:
             print(f"Evaluation samples: {len(eval_dataset)}")
-
-        print("Setting up trainer...")
+        
+        # Setup trainer
         self.setup_trainer(train_dataset, eval_dataset)
-
-        print("Starting training...")
+        
+        # Train
+        print("\nStarting training...")
         self.trainer.train()
-
-        print("Saving final model...")
+        
+        # Save
+        print("\nSaving model...")
         self.trainer.save_model()
         self.trainer.save_state()
-
+        
+        print("\nTraining complete!")
         return self.trainer
 
 
-def load_config_from_yaml(yaml_path: str) -> SFTConfig:
-    """Load configuration from YAML file."""
-    import yaml
-
-    with open(yaml_path, 'r') as f:
-        config_dict = yaml.safe_load()
-
-    return SFTConfig(**config_dict)
-
-
-def train_sft(config_path: str = None, train_data: str = None, eval_data: str = None):
-    """Main training function."""
+def train_sft(
+    config_path: Optional[str] = None,
+    model_key: Optional[str] = None,
+    train_data: Optional[str] = None,
+    eval_data: Optional[str] = None,
+    **overrides
+):
+    """
+    Main training function.
+    
+    Args:
+        config_path: Path to YAML config file
+        model_key: Model key from MODEL_MATRIX (qwen3_8b, llama3_8b, etc.)
+        train_data: Training data path
+        eval_data: Evaluation data path
+        **overrides: Config field overrides
+    """
     # Load config
     if config_path:
-        config = load_config_from_yaml(config_path)
+        config = SFTConfig.from_yaml(config_path)
+    elif model_key:
+        config = create_config_for_model(model_key, **overrides)
     else:
-        config = SFTConfig()
-
-    # Override with command line args
+        # Default Qwen config
+        config = SFTConfig.from_dict({
+            "model": {"name": "Qwen/Qwen3-8B", "chat_template": "qwen"},
+            "lora": {"r": 16, "target_modules": "all-linear"},
+        })
+    
+    # Override paths
     if train_data:
-        config.output_dir = "output/sft_qlora"
-
-    # Setup training
+        config.data.train_path = train_data
+    if eval_data:
+        config.data.eval_path = eval_data
+    
+    # Validate
+    errors = config.validate()
+    if errors:
+        print("Configuration errors:")
+        for err in errors:
+            print(f"  - {err}")
+        return 1
+    
+    # Create trainer
     trainer = CustomerServiceSFTTrainer(config)
+    
+    # Run
+    trainer.train(
+        train_data_path=config.data.train_path,
+        eval_data_path=config.data.eval_path,
+    )
+    
+    return 0
 
-    # Load data
-    train_path = train_data or "data/processed/synthetic_conversations.jsonl"
-    eval_path = eval_data
 
-    # Run training
-    trainer.train(train_path, eval_path)
+# Import helper
+from .sft_config import create_config_for_model
 
-    print("Training complete!")
+
+def main():
+    """CLI entry point."""
+    parser = argparse.ArgumentParser(description="SFT Training")
+    parser.add_argument("--config", type=str, help="Path to YAML config")
+    parser.add_argument("--model", type=str, choices=list(MODEL_MATRIX.keys()), 
+                       help="Model key (qwen3_8b, llama3_8b, etc.)")
+    parser.add_argument("--train_data", type=str, help="Training data path")
+    parser.add_argument("--eval_data", type=str, help="Evaluation data path")
+    parser.add_argument("--output_dir", type=str, help="Output directory")
+    parser.add_argument("--dry_run", action="store_true", help="Dry run without training")
+    
+    args = parser.parse_args()
+    
+    if args.dry_run:
+        print("Dry run mode - validating config only")
+        # Just load and validate
+        if args.config:
+            config = SFTConfig.from_yaml(args.config)
+        elif args.model:
+            config = create_config_for_model(args.model)
+        else:
+            config = SFTConfig()
+        
+        errors = config.validate()
+        if errors:
+            print("Errors found:")
+            for e in errors:
+                print(f"  - {e}")
+            return 1
+        
+        print("Config valid!")
+        print(json.dumps(config.to_dict(), indent=2, default=str))
+        return 0
+    
+    return train_sft(
+        config_path=args.config,
+        model_key=args.model,
+        train_data=args.train_data,
+        eval_data=args.eval_data,
+        output_dir=args.output_dir,
+    )
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, help="Path to YAML config")
-    parser.add_argument("--train_data", type=str, help="Training data path")
-    parser.add_argument("--eval_data", type=str, help="Evaluation data path")
-    args = parser.parse_args()
-
-    train_sft(
-        config_path=args.config,
-        train_data=args.train_data,
-        eval_data=args.eval_data,
-    )
+    exit(main())

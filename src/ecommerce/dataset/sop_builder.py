@@ -7,19 +7,22 @@ fictional policies for the e-commerce customer service domain.
 Business Scope:
 - 3C Electronics Store (headphones, chargers, cables, phone cases)
 - 6 Intent Categories: logistics, returns, exchanges, specifications, coupons, complaints
+
+All policy IDs are explicitly defined and stable, not auto-generated counters.
 """
 
-from dataclasses import dataclass, field, asdict
-from typing import Optional, Literal
-from datetime import datetime
+import argparse
 import json
 import hashlib
+from dataclasses import dataclass, field, asdict
+from typing import Optional, List, Dict, Any, Literal
+from pathlib import Path
 
 
 # Policy Decision Categories
-ReturnCategory = Literal["full_refund", "exchange", "manual_inspection", "reject"]
-ExchangeCategory = Literal["same_model", "different_model", "repair", "reject"]
-LogisticsStatus = Literal["in_transit", "delivered", "exception", "pending"]
+ReturnDecision = Literal["full_refund", "exchange", "manual_inspection", "reject"]
+ExchangeDecision = Literal["exchange", "repair", "reject"]
+LogisticsDecision = Literal["ship_within_48h", "cancel_with_compensation", "resend_or_refund", "need_more_info"]
 
 
 @dataclass
@@ -27,7 +30,7 @@ class PolicyCondition:
     """A single condition for a policy decision."""
     field: str
     operator: str  # eq, ne, gt, lt, gte, lte, in, not_in
-    value: any
+    value: Any
     description: str = ""
 
 
@@ -37,33 +40,41 @@ class PolicyDecision:
     decision: str
     reasoning: str
     requires_human: bool = False
-    escalation_reasons: list[str] = field(default_factory=list)
+    escalation_reasons: List[str] = field(default_factory=list)
 
 
 @dataclass
 class Policy:
     """A complete policy with conditions and decisions."""
-    policy_id: str
+    policy_id: str  # Stable, explicitly defined
     version: str
     effective_from: str
     category: str  # return, exchange, logistics, specification, coupon, complaint
     title: str
     description: str
-    conditions: list[PolicyCondition]
-    decisions: list[PolicyDecision]
+    conditions: List[PolicyCondition]
+    decisions: List[PolicyDecision]
     evidence: str  # Reference to SOP document
     owner: str = "project_author"
-    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    created_at: str = ""
+    effective_to: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Policy":
+        """Create from dict."""
+        data = dict(data)
+        data["conditions"] = [PolicyCondition(**c) for c in data.get("conditions", [])]
+        data["decisions"] = [PolicyDecision(**d) for d in data.get("decisions", [])]
+        return cls(**data)
 
     def check_conditions(self, context: dict) -> Optional[PolicyDecision]:
         """Check if context matches policy conditions."""
         for condition in self.conditions:
             if not self._check_single_condition(context, condition):
                 return None
-        # Return the first matching decision
         return self.decisions[0] if self.decisions else None
 
     def _check_single_condition(self, context: dict, condition: PolicyCondition) -> bool:
@@ -95,168 +106,79 @@ class Policy:
 
 
 class SOPBuilder:
-    """Builder for fictional 3C store SOP policies."""
+    """
+    Builder for fictional 3C store SOP policies.
+    
+    Uses explicitly defined stable policy IDs.
+    """
 
-    def __init__(self):
-        self.policies: list[Policy] = []
-        self._policy_counter = 0
+    def __init__(self, version: str = "2026-07-16"):
+        self.policies: List[Policy] = []
+        self.version = version
+        self.created_at = ""  # Set when build is called
 
-    def _make_policy_id(self, category: str) -> str:
-        """Generate a unique policy ID."""
-        self._policy_counter += 1
-        return f"{category}_3c_{self._policy_counter:03d}"
+    def add_policy(
+        self,
+        policy_id: str,  # Explicitly defined
+        category: str,
+        title: str,
+        description: str,
+        conditions: List[Dict],
+        decisions: List[Dict],
+        evidence: str = "",
+    ) -> Policy:
+        """Add a policy with explicit ID."""
+        policy = Policy(
+            policy_id=policy_id,
+            version=self.version,
+            effective_from=self.version,
+            category=category,
+            title=title,
+            description=description,
+            conditions=[PolicyCondition(**c) for c in conditions],
+            decisions=[PolicyDecision(**d) for d in decisions],
+            evidence=evidence or f"虚构商家{category}SOP",
+            created_at=self.created_at,
+        )
+        self.policies.append(policy)
+        return policy
+
+    # === RETURN POLICIES ===
 
     def add_return_policy(
         self,
+        policy_id: str,
         title: str,
         description: str,
-        conditions: list[dict],
-        decisions: list[dict],
+        conditions: List[dict],
+        decisions: List[dict],
         evidence: str = ""
     ) -> Policy:
         """Add a return policy."""
-        policy = Policy(
-            policy_id=self._make_policy_id("return"),
-            version="2026-07-16",
-            effective_from="2026-07-16",
+        return self.add_policy(
+            policy_id=policy_id,
             category="return",
             title=title,
             description=description,
-            conditions=[PolicyCondition(**c) for c in conditions],
-            decisions=[PolicyDecision(**d) for d in decisions],
-            evidence=evidence or "虚构商家售后SOP"
+            conditions=conditions,
+            decisions=decisions,
+            evidence=evidence,
         )
-        self.policies.append(policy)
-        return policy
 
-    def add_exchange_policy(
-        self,
-        title: str,
-        description: str,
-        conditions: list[dict],
-        decisions: list[dict],
-        evidence: str = ""
-    ) -> Policy:
-        """Add an exchange policy."""
-        policy = Policy(
-            policy_id=self._make_policy_id("exchange"),
-            version="2026-07-16",
-            effective_from="2026-07-16",
-            category="exchange",
-            title=title,
-            description=description,
-            conditions=[PolicyCondition(**c) for c in conditions],
-            decisions=[PolicyDecision(**d) for d in decisions],
-            evidence=evidence or "虚构商家售后SOP"
-        )
-        self.policies.append(policy)
-        return policy
-
-    def add_logistics_policy(
-        self,
-        title: str,
-        description: str,
-        conditions: list[dict],
-        decisions: list[dict],
-        evidence: str = ""
-    ) -> Policy:
-        """Add a logistics policy."""
-        policy = Policy(
-            policy_id=self._make_policy_id("logistics"),
-            version="2026-07-16",
-            effective_from="2026-07-16",
-            category="logistics",
-            title=title,
-            description=description,
-            conditions=[PolicyCondition(**c) for c in conditions],
-            decisions=[PolicyDecision(**d) for d in decisions],
-            evidence=evidence or "虚构商家物流SOP"
-        )
-        self.policies.append(policy)
-        return policy
-
-    def add_coupon_policy(
-        self,
-        title: str,
-        description: str,
-        conditions: list[dict],
-        decisions: list[dict],
-        evidence: str = ""
-    ) -> Policy:
-        """Add a coupon/price protection policy."""
-        policy = Policy(
-            policy_id=self._make_policy_id("coupon"),
-            version="2026-07-16",
-            effective_from="2026-07-16",
-            category="coupon",
-            title=title,
-            description=description,
-            conditions=[PolicyCondition(**c) for c in conditions],
-            decisions=[PolicyDecision(**d) for d in decisions],
-            evidence=evidence or "虚构商家优惠SOP"
-        )
-        self.policies.append(policy)
-        return policy
-
-    def add_specification_policy(
-        self,
-        title: str,
-        description: str,
-        conditions: list[dict],
-        decisions: list[dict],
-        evidence: str = ""
-    ) -> Policy:
-        """Add a product specification policy."""
-        policy = Policy(
-            policy_id=self._make_policy_id("specification"),
-            version="2026-07-16",
-            effective_from="2026-07-16",
-            category="specification",
-            title=title,
-            description=description,
-            conditions=[PolicyCondition(**c) for c in conditions],
-            decisions=[PolicyDecision(**d) for d in decisions],
-            evidence=evidence or "虚构商家商品SOP"
-        )
-        self.policies.append(policy)
-        return policy
-
-    def add_complaint_policy(
-        self,
-        title: str,
-        description: str,
-        conditions: list[dict],
-        decisions: list[dict],
-        evidence: str = ""
-    ) -> Policy:
-        """Add a complaint handling policy."""
-        policy = Policy(
-            policy_id=self._make_policy_id("complaint"),
-            version="2026-07-16",
-            effective_from="2026-07-16",
-            category="complaint",
-            title=title,
-            description=description,
-            conditions=[PolicyCondition(**c) for c in conditions],
-            decisions=[PolicyDecision(**d) for d in decisions],
-            evidence=evidence or "虚构商家投诉SOP"
-        )
-        self.policies.append(policy)
-        return policy
-
-    def build_fictional_store_sops(self) -> list[Policy]:
-        """Build complete fictional 3C store SOPs."""
+    def build_fictional_store_sops(self) -> List[Policy]:
+        """Build complete fictional 3C store SOPs with stable IDs."""
 
         # === RETURN POLICIES ===
-
-        # 退货-未拆封
+        
+        # return_001: 7天无理由退货（未拆封）
         self.add_return_policy(
+            policy_id="return_001",
             title="7天无理由退货（未拆封）",
             description="商品未拆封且不影响二次销售，可在7天内申请退货",
             conditions=[
                 {"field": "days_since_delivery", "operator": "lte", "value": 7, "description": "收货7天内"},
                 {"field": "package_status", "operator": "eq", "value": "unopened", "description": "包装未拆封"},
-                {"field": "damage_by_user", "operator": "eq", "value": False, "description": "无人为损坏"},
+                {"field": "user_damage", "operator": "eq", "value": False, "description": "无人为损坏"},
             ],
             decisions=[
                 {"decision": "full_refund", "reasoning": "符合7天无理由退货条件", "requires_human": False}
@@ -264,8 +186,9 @@ class SOPBuilder:
             evidence="虚构商家售后SOP 第3.1条"
         )
 
-        # 退货-已拆封但完好
+        # return_002: 7天无理由退货（已拆封完好）
         self.add_return_policy(
+            policy_id="return_002",
             title="7天无理由退货（已拆封完好）",
             description="已拆封但商品完好、配件齐全，可在7天内申请退货",
             conditions=[
@@ -280,8 +203,9 @@ class SOPBuilder:
             evidence="虚构商家售后SOP 第3.2条"
         )
 
-        # 退货-质量问题
+        # return_003: 质量问题退货
         self.add_return_policy(
+            policy_id="return_003",
             title="质量问题退货",
             description="商品存在质量问题，不受7天限制，可申请退货",
             conditions=[
@@ -295,8 +219,9 @@ class SOPBuilder:
             evidence="虚构商家售后SOP 第3.3条"
         )
 
-        # 退货-超期
+        # return_004: 超期退货申请
         self.add_return_policy(
+            policy_id="return_004",
             title="超期退货申请",
             description="超过7天无理由退货期，不适用无理由退货",
             conditions=[
@@ -304,15 +229,17 @@ class SOPBuilder:
                 {"field": "quality_issue", "operator": "eq", "value": False, "description": "非质量问题"},
             ],
             decisions=[
-                {"decision": "reject", "reasoning": "超过无理由退货期限", "requires_human": False, "escalation_reasons": ["用户强烈投诉"]}
+                {"decision": "reject", "reasoning": "超过无理由退货期限", "requires_human": False, "escalation_reasons": ["用户强烈投诉可转人工"]}
             ],
             evidence="虚构商家售后SOP 第3.4条"
         )
 
         # === EXCHANGE POLICIES ===
 
-        # 换货-尺码/颜色
-        self.add_exchange_policy(
+        # exchange_001: 换货-尺码或颜色
+        self.add_policy(
+            policy_id="exchange_001",
+            category="exchange",
             title="换货-尺码或颜色",
             description="同款商品可换尺码或颜色，需商品完好",
             conditions=[
@@ -326,8 +253,10 @@ class SOPBuilder:
             evidence="虚构商家售后SOP 第4.1条"
         )
 
-        # 换货-质量问题
-        self.add_exchange_policy(
+        # exchange_002: 质量问题换货
+        self.add_policy(
+            policy_id="exchange_002",
+            category="exchange",
             title="质量问题换货",
             description="质量问题可申请换货或维修",
             conditions=[
@@ -342,13 +271,15 @@ class SOPBuilder:
 
         # === LOGISTICS POLICIES ===
 
-        # 物流-发货时间
-        self.add_logistics_policy(
+        # logistics_001: 发货时间规定
+        self.add_policy(
+            policy_id="logistics_001",
+            category="logistics",
             title="发货时间规定",
             description="现货订单48小时内发货，预售订单按页面时间",
             conditions=[
                 {"field": "order_type", "operator": "eq", "value": "in_stock", "description": "现货订单"},
-                {"field": "payment_confirmed", "operator": "eq", "value": True, "description": "已付款"},
+                {"field": "shipped", "operator": "eq", "value": False, "description": "未发货"},
             ],
             decisions=[
                 {"decision": "ship_within_48h", "reasoning": "现货订单48小时内发货", "requires_human": False}
@@ -356,13 +287,16 @@ class SOPBuilder:
             evidence="虚构商家物流SOP 第2.1条"
         )
 
-        # 物流-延迟发货
-        self.add_logistics_policy(
+        # logistics_002: 延迟发货处理
+        self.add_policy(
+            policy_id="logistics_002",
+            category="logistics",
             title="延迟发货处理",
             description="超过承诺发货时间未发货，可申请赔偿或取消",
             conditions=[
+                {"field": "order_type", "operator": "eq", "value": "in_stock", "description": "现货订单"},
                 {"field": "shipped", "operator": "eq", "value": False, "description": "未发货"},
-                {"field": "hours_since_承诺时间", "operator": "gt", "value": 0, "description": "已超过承诺时间"},
+                {"field": "days_since_order", "operator": "gt", "value": 2, "description": "付款超过48小时"},
             ],
             decisions=[
                 {"decision": "cancel_with_compensation", "reasoning": "延迟发货可赔偿或取消", "requires_human": True}
@@ -370,8 +304,10 @@ class SOPBuilder:
             evidence="虚构商家物流SOP 第2.2条"
         )
 
-        # 物流-丢件
-        self.add_logistics_policy(
+        # logistics_003: 丢件处理
+        self.add_policy(
+            policy_id="logistics_003",
+            category="logistics",
             title="丢件处理",
             description="物流显示签收但用户未收到，可申请退款或补发",
             conditions=[
@@ -384,10 +320,12 @@ class SOPBuilder:
             evidence="虚构商家物流SOP 第2.3条"
         )
 
-        # === COUPON POLICIES ===
+        # === COUPON/POLICY PROTECTION POLICIES ===
 
-        # 优惠券-价格保护
-        self.add_coupon_policy(
+        # coupon_001: 价格保护政策
+        self.add_policy(
+            policy_id="coupon_001",
+            category="coupon",
             title="价格保护政策",
             description="订单签收后7天内，同款商品降价可申请差价退还",
             conditions=[
@@ -401,8 +339,10 @@ class SOPBuilder:
             evidence="虚构商家优惠SOP 第5.1条"
         )
 
-        # 优惠券-不可用情况
-        self.add_coupon_policy(
+        # coupon_002: 优惠券使用限制
+        self.add_policy(
+            policy_id="coupon_002",
+            category="coupon",
             title="优惠券使用限制",
             description="部分情况不可使用优惠券",
             conditions=[
@@ -416,36 +356,42 @@ class SOPBuilder:
 
         # === SPECIFICATION POLICIES ===
 
-        # 规格-兼容性
-        self.add_specification_policy(
+        # specification_001: 商品兼容性查询
+        self.add_policy(
+            policy_id="specification_001",
+            category="specification",
             title="商品兼容性查询",
             description="提供商品兼容性信息，帮助用户确认是否适用",
             conditions=[
                 {"field": "user_asked_compatibility", "operator": "eq", "value": True, "description": "询问兼容性问题"},
             ],
             decisions=[
-                {"decision": "provide_compatibility_info", "reasoning": "提供兼容性信息", "requires_human": False}
+                {"decision": "provide_info", "reasoning": "提供兼容性信息", "requires_human": False}
             ],
             evidence="虚构商家商品SOP 第6.1条"
         )
 
         # === COMPLAINT POLICIES ===
 
-        # 投诉-服务态度
-        self.add_complaint_policy(
+        # complaint_001: 服务投诉处理
+        self.add_policy(
+            policy_id="complaint_001",
+            category="complaint",
             title="服务投诉处理",
             description="用户对服务态度不满，可升级处理",
             conditions=[
                 {"field": "complaint_type", "operator": "eq", "value": "service_attitude", "description": "服务态度投诉"},
             ],
             decisions=[
-                {"decision": "escalate_to_supervisor", "reasoning": "服务投诉需升级主管处理", "requires_human": True}
+                {"decision": "escalate", "reasoning": "服务投诉需升级主管处理", "requires_human": True}
             ],
             evidence="虚构商家投诉SOP 第7.1条"
         )
 
-        # 投诉-虚假宣传
-        self.add_complaint_policy(
+        # complaint_002: 虚假宣传投诉
+        self.add_policy(
+            policy_id="complaint_002",
+            category="complaint",
             title="虚假宣传投诉",
             description="如商品描述与实际不符，可退货退款",
             conditions=[
@@ -462,6 +408,7 @@ class SOPBuilder:
 
     def save_policies(self, output_path: str):
         """Save policies to JSON file."""
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump([p.to_dict() for p in self.policies], f, ensure_ascii=False, indent=2)
 
@@ -486,12 +433,14 @@ class SOPBuilder:
         }
 
 
-def build_sops():
-    """Build SOPs and save to default location."""
+def build_sops(output_path: str = "data/processed/fixtures/policies.json"):
+    """Build SOPs and save to file."""
+    from datetime import datetime
+    
     builder = SOPBuilder()
+    builder.created_at = datetime.now().isoformat()
     policies = builder.build_fictional_store_sops()
 
-    output_path = "data/processed/policies_v1.json"
     builder.save_policies(output_path)
 
     report = builder.generate_policy_report()
@@ -503,5 +452,42 @@ def build_sops():
     return policies
 
 
+def main():
+    """CLI entry point."""
+    parser = argparse.ArgumentParser(
+        description="Build SOP policies for fictional 3C store"
+    )
+    parser.add_argument(
+        "--output", "-o",
+        type=str,
+        default="data/processed/fixtures/policies.json",
+        help="Output path for policies JSON"
+    )
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Validate policies after building"
+    )
+    
+    args = parser.parse_args()
+    
+    # Build SOPs
+    policies = build_sops(args.output)
+    
+    # Validate if requested
+    if args.validate:
+        from .policy_engine import validate_policy_uniqueness
+        errors = validate_policy_uniqueness([p.to_dict() for p in policies])
+        if errors:
+            print("Validation errors:")
+            for e in errors:
+                print(f"  - {e}")
+            return 1
+        print("Validation passed: all policy IDs unique")
+    
+    print(f"\nOutput saved to: {args.output}")
+    return 0
+
+
 if __name__ == "__main__":
-    build_sops()
+    exit(main())

@@ -1,8 +1,12 @@
-# Python
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+
+# C extensions
 *.so
+
+# Distribution / packaging
 .Python
 build/
 develop-eggs/
@@ -20,71 +24,110 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual environments
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Environments
+.env
+.venv
+env/
 venv/
 ENV/
-env/
-.venv/
-
-# Jupyter
-.ipynb_checkpoints/
-*.ipynb
+env.bak/
+venv.bak/
 
 # IDE
-.vscode/
 .idea/
+.vscode/
 *.swp
 *.swo
 *~
+.DS_Store
 
-# Data - keep structure, ignore large files
-data/raw/*
-!data/raw/.gitkeep
-data/interim/*
-!data/interim/.gitkeep
-data/quarantine/*
-!data/quarantine/.gitkeep
-models/
-*.pdf
-*.pdf.dvc
-*.parquet
-*.arrow
+# Jupyter Notebook
+.ipynb_checkpoints
 
-# DVC
+# pyenv
+.python-version
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Ruff
+.ruff_cache/
+
+# Output and model directories
+output/
+checkpoints/
+logs/
+*.pt
+*.bin
+*.safetensors
+*.gguf
+
+# Data directories (raw, processed)
+data/raw/
+data/processed/
+data/index/
+!data/fixtures/
+!data/fixtures/**/
+
+# Model weights
+*.ckpt
+*adapter*/
+*lora*/
+
+# FAISS indexes
+*.faiss
+*.index
+
+# DVC cache
 .dvc/
 .dvcignore
+
+# Local configs with secrets
+config.local.yaml
+secrets.yaml
 
 # Logs
 *.log
 logs/
 
-# Environment
-.env
-.env.local
-*.lock
-*lock.json
+# Temporary files
+tmp/
+temp/
+*.tmp
 
-# OS
-.DS_Store
-Thumbs.db
+# Research/notebooks
+notebooks/
+research/
+*.ipynb
 
-# ML artifacts
-*.ckpt
-*.pt
-*.pth
-*.safetensors
-checkpoints/
-wandb/
-mlruns/
-tensorboard/
-
-# Test outputs
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Secrets
-*.pem
-*.key
-secrets/
-credentials/
+# Large fixture data
+data/fixtures/**/*.jsonl
+data/fixtures/**/*.parquet

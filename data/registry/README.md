@@ -1,71 +1,43 @@
-# Data Source Registry
+# Data Registry
 
-## Purpose
-
-This registry tracks all data sources used in the project, including their licensing, acquisition method, and usage permissions.
+This directory tracks data sources used in the project.
 
 ## Schema
 
-Each data source entry must include:
-
 | Field | Type | Description |
-|-------|------|-------------|
-| `source_id` | string | Unique stable identifier |
-| `source_name` | string | Human-readable name |
-| `source_url` | string | Original source URL or dataset card |
-| `publisher` | string | Author/organization |
-| `acquired_at` | date | Download/acquisition date (ISO 8601) |
-| `published_at` | date | Original publication date |
-| `license` | string | SPDX identifier or description |
-| `allowed_uses` | dict | Per-use-type boolean flags |
-| `contains_pii` | boolean | Whether data may contain PII |
-| `checksum_sha256` | string | SHA-256 hash of original file |
-| `version` | string | Dataset revision or document version |
-| `notes` | string | Additional restrictions or notes |
+|--------|------|-------------|
+| source_id | string | Unique identifier |
+| source_name | string | Human readable name |
+| source_url | string | URL or location |
+| publisher | string | Data publisher |
+| acquired_at | date | Acquisition date |
+| published_at | date | Publication date |
+| license | string | License name |
+| allowed_train | bool | Allowed for training |
+| allowed_evaluate | bool | Allowed for evaluation |
+| allowed_local_demo | bool | Allowed for local demo |
+| allowed_redistribute | bool | Allowed for redistribution |
+| contains_pii | bool | Contains PII |
+| checksum_sha256 | string | File hash |
+| status | string | planned/acquired/quarantine/rejected |
+| notes | string | Additional notes |
 
-## allowed_uses Flags
+## Data Sources
 
-```json
-{
-  "train": false,       // Can be used in training
-  "evaluate": true,     // Can be used in evaluation
-  "local_demo": true,   // Can be used in local demos
-  "redistribute": false // Can be redistributed
-}
-```
+### Owned SOP Data
 
-## Example Entry
+| Field | Value |
+|-------|-------|
+| source_id | owned_sop_v1 |
+| source_name | Fictional 3C Store SOP |
+| license | CC0 (public domain) |
+| status | acquired |
+| notes | Self-generated fictional store policies |
 
-```json
-{
-  "source_id": "cninfo_annual_002594_2025",
-  "source_name": "示例公司2025年年度报告",
-  "source_url": "https://www.cninfo.com.cn/new/disclosure/detail?stockCode=002594&announcementId=123456",
-  "publisher": "示例股份有限公司",
-  "acquired_at": "2026-03-28",
-  "published_at": "2026-03-28",
-  "license": "official-disclosure",
-  "allowed_uses": {
-    "train": false,
-    "evaluate": true,
-    "local_demo": true,
-    "redistribute": false
-  },
-  "contains_pii": false,
-  "checksum_sha256": "abc123...",
-  "version": "1.0",
-  "notes": "Official stock exchange disclosure. For local research only. PDF redistribution not permitted."
-}
-```
+### Public Datasets
 
-## Registry File
-
-The actual registry is stored in `data/registry/sources.csv` and updated with each new data acquisition.
-
-## Workflow
-
-1. Before downloading any data, create a registry entry
-2. Fill in known information before acquisition
-3. Complete entry after download (checksum, license verification)
-4. Move to quarantine if license is unclear
-5. Never use data without a complete registry entry
+| Dataset | License | Status | Notes |
+|---------|---------|--------|-------|
+| thu-coai/CrossWOZ | Apache-2.0 | planned | Chinese task-oriented dialogue |
+| AmazonScience/massive | CC BY 4.0 | planned | Multilingual intent classification |
+| bitext/Bitext-customer-support | CDLA-Sharing-1.0 | planned | English customer support |

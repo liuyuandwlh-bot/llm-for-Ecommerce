@@ -1,0 +1,51 @@
+# SFT Configuration for Llama-3.1-8B-Instruct (BF16 LoRA)
+
+model:
+  name: "meta-llama/Llama-3.1-8B-Instruct"
+  revision: "main"
+  trust_remote_code: true
+  chat_template: "llama"
+
+quantization:
+  enabled: false  # BF16 LoRA, not QLoRA
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: "all-linear"  # Will auto-detect for Llama
+  bias: "none"
+
+training:
+  num_train_epochs: 2
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 8
+  learning_rate: 2.0e-4
+  warmup_ratio: 0.05
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  max_seq_length: 1536
+  packing: false
+
+evaluation:
+  eval_strategy: "steps"
+  eval_steps: 100
+  save_strategy: "steps"
+  save_steps: 100
+  save_total_limit: 3
+  load_best_model_at_end: true
+
+output:
+  output_dir: "output/sft/llama3_8b"
+  run_name: "sft_llama3_8b"
+
+hardware:
+  gradient_checkpointing: true
+  bf16: true
+  fp16: false
+  seed: 42
+
+data:
+  train_path: "data/processed/fixtures/release_v1/train.jsonl"
+  eval_path: "data/processed/fixtures/release_v1/dev.jsonl"
+  max_samples: null
