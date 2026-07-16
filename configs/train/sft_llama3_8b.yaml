@@ -2,7 +2,7 @@
 
 model:
   name: "meta-llama/Llama-3.1-8B-Instruct"
-  revision: "main"
+  revision: "0e9e39d2491cf9c0c70d9b0bb1fbe3b13eae0e36"  # pinned; manual HF license acceptance required
   trust_remote_code: true
   chat_template: "llama"
 

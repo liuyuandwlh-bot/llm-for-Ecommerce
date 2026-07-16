@@ -7,12 +7,12 @@ Based on recommended plan:
 - Manifest tracks source_id, publisher, published_at, license, checksum
 """
 
-from dataclasses import dataclass, field
-from typing import Optional, List, Literal
-from datetime import datetime
-import json
 import hashlib
+import json
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 
 @dataclass
@@ -20,7 +20,7 @@ class DocumentManifest:
     """Manifest entry for a single document."""
     doc_id: str
     company: str
-    stock_code: Optional[str]
+    stock_code: str | None
     report_type: Literal[
         "annual_report",
         "half_year_report",
@@ -81,7 +81,7 @@ class DocumentIngestor:
     def __init__(self, save_dir: str = "data/raw/reports"):
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
-        self.manifest: List[DocumentManifest] = []
+        self.manifest: list[DocumentManifest] = []
         self._manifest_path = self.save_dir.parent / "document_manifest.json"
 
     def _compute_sha256(self, file_path: Path) -> str:
@@ -95,7 +95,7 @@ class DocumentIngestor:
     def _generate_doc_id(
         self,
         source: str,
-        stock_code: Optional[str],
+        stock_code: str | None,
         report_type: str,
         fiscal_period: str,
     ) -> str:
@@ -107,7 +107,7 @@ class DocumentIngestor:
         self,
         file_path: Path,
         company: str,
-        stock_code: Optional[str] = None,
+        stock_code: str | None = None,
         report_type: str = "other",
         fiscal_period: str = "",
         published_at: str = "",
@@ -130,13 +130,13 @@ class DocumentIngestor:
             fiscal_period=fiscal_period,
         )
 
-        # Get page count
-        import fitz
+        # Get page count (best-effort, may fail for non-PDF inputs)
+        page_count = 0
         try:
-            doc = fitz.open(file_path)
-            page_count = len(doc)
-            doc.close()
-        except:
+            import fitz  # type: ignore
+            with fitz.open(str(file_path)) as doc:
+                page_count = len(doc)
+        except Exception:
             page_count = 0
 
         manifest = DocumentManifest(
@@ -176,17 +176,17 @@ class DocumentIngestor:
             print(f"No manifest found at: {self._manifest_path}")
             return
 
-        with open(self._manifest_path, 'r', encoding='utf-8') as f:
+        with open(self._manifest_path, encoding='utf-8') as f:
             manifest_data = json.load(f)
 
         self.manifest = [DocumentManifest.from_dict(m) for m in manifest_data]
         print(f"Loaded {len(self.manifest)} documents from manifest")
 
-    def get_documents_by_type(self, report_type: str) -> List[DocumentManifest]:
+    def get_documents_by_type(self, report_type: str) -> list[DocumentManifest]:
         """Get all documents of a specific type."""
         return [m for m in self.manifest if m.report_type == report_type]
 
-    def get_documents_by_company(self, company: str) -> List[DocumentManifest]:
+    def get_documents_by_company(self, company: str) -> list[DocumentManifest]:
         """Get all documents from a specific company."""
         return [m for m in self.manifest if m.company == company]
 
@@ -225,6 +225,15 @@ def create_sample_manifest():
 
 
 if __name__ == "__main__":
-    # Demo
-    manifest = create_sample_manifest()
-    print("Sample manifest created")
+    import argparse
+    parser = argparse.ArgumentParser(description="Document ingest manifest helper")
+    parser.add_argument("--save-dir", default="data/raw/reports")
+    parser.add_argument("--emit-sample", action="store_true",
+                        help="Print a sample manifest describing how a real "
+                             "ingest run would look; no PDF download happens.")
+    args = parser.parse_args()
+
+    if args.emit_sample:
+        create_sample_manifest()
+    else:
+        print("Document ingest helper. Use --emit-sample to print a sample.")

@@ -13,11 +13,9 @@ All policy IDs are explicitly defined and stable, not auto-generated counters.
 
 import argparse
 import json
-import hashlib
-from dataclasses import dataclass, field, asdict
-from typing import Optional, List, Dict, Any, Literal
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-
+from typing import Any, Literal
 
 # Policy Decision Categories
 ReturnDecision = Literal["full_refund", "exchange", "manual_inspection", "reject"]
@@ -40,7 +38,7 @@ class PolicyDecision:
     decision: str
     reasoning: str
     requires_human: bool = False
-    escalation_reasons: List[str] = field(default_factory=list)
+    escalation_reasons: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -52,12 +50,12 @@ class Policy:
     category: str  # return, exchange, logistics, specification, coupon, complaint
     title: str
     description: str
-    conditions: List[PolicyCondition]
-    decisions: List[PolicyDecision]
+    conditions: list[PolicyCondition]
+    decisions: list[PolicyDecision]
     evidence: str  # Reference to SOP document
     owner: str = "project_author"
     created_at: str = ""
-    effective_to: Optional[str] = None
+    effective_to: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -70,7 +68,7 @@ class Policy:
         data["decisions"] = [PolicyDecision(**d) for d in data.get("decisions", [])]
         return cls(**data)
 
-    def check_conditions(self, context: dict) -> Optional[PolicyDecision]:
+    def check_conditions(self, context: dict) -> PolicyDecision | None:
         """Check if context matches policy conditions."""
         for condition in self.conditions:
             if not self._check_single_condition(context, condition):
@@ -108,12 +106,12 @@ class Policy:
 class SOPBuilder:
     """
     Builder for fictional 3C store SOP policies.
-    
+
     Uses explicitly defined stable policy IDs.
     """
 
     def __init__(self, version: str = "2026-07-16"):
-        self.policies: List[Policy] = []
+        self.policies: list[Policy] = []
         self.version = version
         self.created_at = ""  # Set when build is called
 
@@ -123,8 +121,8 @@ class SOPBuilder:
         category: str,
         title: str,
         description: str,
-        conditions: List[Dict],
-        decisions: List[Dict],
+        conditions: list[dict],
+        decisions: list[dict],
         evidence: str = "",
     ) -> Policy:
         """Add a policy with explicit ID."""
@@ -150,8 +148,8 @@ class SOPBuilder:
         policy_id: str,
         title: str,
         description: str,
-        conditions: List[dict],
-        decisions: List[dict],
+        conditions: list[dict],
+        decisions: list[dict],
         evidence: str = ""
     ) -> Policy:
         """Add a return policy."""
@@ -165,11 +163,11 @@ class SOPBuilder:
             evidence=evidence,
         )
 
-    def build_fictional_store_sops(self) -> List[Policy]:
+    def build_fictional_store_sops(self) -> list[Policy]:
         """Build complete fictional 3C store SOPs with stable IDs."""
 
         # === RETURN POLICIES ===
-        
+
         # return_001: 7天无理由退货（未拆封）
         self.add_return_policy(
             policy_id="return_001",
@@ -236,16 +234,16 @@ class SOPBuilder:
 
         # === EXCHANGE POLICIES ===
 
-        # exchange_001: 换货-尺码或颜色
+        # exchange_001: 换货-颜色（3C 业务，去掉服装尺码）
         self.add_policy(
             policy_id="exchange_001",
             category="exchange",
-            title="换货-尺码或颜色",
-            description="同款商品可换尺码或颜色，需商品完好",
+            title="换货-颜色或型号",
+            description="同款商品可换颜色或型号，需商品完好",
             conditions=[
                 {"field": "days_since_delivery", "operator": "lte", "value": 15, "description": "收货15天内"},
                 {"field": "user_damage", "operator": "eq", "value": False, "description": "无人为损坏"},
-                {"field": "exchange_type", "operator": "in", "value": ["size", "color"], "description": "换同款尺码或颜色"},
+                {"field": "exchange_type", "operator": "in", "value": ["color", "variant"], "description": "换同款颜色或型号"},
             ],
             decisions=[
                 {"decision": "exchange", "reasoning": "符合换货条件", "requires_human": False}
@@ -271,15 +269,16 @@ class SOPBuilder:
 
         # === LOGISTICS POLICIES ===
 
-        # logistics_001: 发货时间规定
+        # logistics_001: 发货时间规定 — 现货且未发货且在48h 承诺期内则 ship_within_48h
         self.add_policy(
             policy_id="logistics_001",
             category="logistics",
             title="发货时间规定",
-            description="现货订单48小时内发货，预售订单按页面时间",
+            description="现货订单在48h承诺期内未发货，承诺48h内发货",
             conditions=[
                 {"field": "order_type", "operator": "eq", "value": "in_stock", "description": "现货订单"},
                 {"field": "shipped", "operator": "eq", "value": False, "description": "未发货"},
+                {"field": "days_since_order", "operator": "lte", "value": 2, "description": "距下单 48h 以内"},
             ],
             decisions=[
                 {"decision": "ship_within_48h", "reasoning": "现货订单48小时内发货", "requires_human": False}
@@ -356,7 +355,7 @@ class SOPBuilder:
 
         # === SPECIFICATION POLICIES ===
 
-        # specification_001: 商品兼容性查询
+        # specification_001: 商品兼容性查询 — 需要 target_device 才能精确回答
         self.add_policy(
             policy_id="specification_001",
             category="specification",
@@ -364,6 +363,7 @@ class SOPBuilder:
             description="提供商品兼容性信息，帮助用户确认是否适用",
             conditions=[
                 {"field": "user_asked_compatibility", "operator": "eq", "value": True, "description": "询问兼容性问题"},
+                {"field": "target_device", "operator": "in", "value": ["华为P50", "iPhone 15", "小米14"], "description": "已知设备"},
             ],
             decisions=[
                 {"decision": "provide_info", "reasoning": "提供兼容性信息", "requires_human": False}
@@ -436,7 +436,7 @@ class SOPBuilder:
 def build_sops(output_path: str = "data/processed/fixtures/policies.json"):
     """Build SOPs and save to file."""
     from datetime import datetime
-    
+
     builder = SOPBuilder()
     builder.created_at = datetime.now().isoformat()
     policies = builder.build_fictional_store_sops()
@@ -468,12 +468,24 @@ def main():
         action="store_true",
         help="Validate policies after building"
     )
-    
+    parser.add_argument(
+        "--registry",
+        type=str,
+        default=None,
+        help="Optional data registry JSON. If given, the built artifact's SHA-256 is recorded and the source status is moved to acquired.",
+    )
+    parser.add_argument(
+        "--source-id",
+        type=str,
+        default="owned_sop_v1",
+        help="Registry source_id to update on success.",
+    )
+
     args = parser.parse_args()
-    
+
     # Build SOPs
     policies = build_sops(args.output)
-    
+
     # Validate if requested
     if args.validate:
         from .policy_engine import validate_policy_uniqueness
@@ -484,7 +496,25 @@ def main():
                 print(f"  - {e}")
             return 1
         print("Validation passed: all policy IDs unique")
-    
+
+    if args.registry:
+        try:
+            import hashlib
+
+            from .registry import update_registry_checksum
+            with open(args.output, 'rb') as f:
+                digest = hashlib.sha256(f.read()).hexdigest()
+            update_registry_checksum(
+                args.registry,
+                args.source_id,
+                checksum=digest,
+                status="acquired",
+            )
+            print(f"Registry updated: {args.source_id} -> {digest[:12]}...")
+        except Exception as exc:
+            print(f"Registry update failed: {exc}")
+            return 1
+
     print(f"\nOutput saved to: {args.output}")
     return 0
 

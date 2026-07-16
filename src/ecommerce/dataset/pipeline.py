@@ -1,531 +1,655 @@
 """
 Data Pipeline for E-commerce Training Data
 
-Implements the complete data processing funnel:
-1. Schema validation
-2. PII scan/mask
-3. Policy/decision consistency
-4. Message role/order validation
-5. Quality filtering
-6. Exact dedup
-7. Near dedup
-8. Split assignment
+Round 2:
+- Per-stage funnel counts (no rolling counters)
+- First-failure attribution per sample
+- Real registry validation (status/license/checksum)
+- Real n-gram Jaccard near-dedup
+- Group-aware stratified split with leakage report and cross-process
+  determinism via stable hashing.
 """
 
 import argparse
-import json
 import hashlib
-from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional, Set
-from pathlib import Path
+import json
 from collections import defaultdict
-import re
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
+from src.common.hashing import Hashing
+from src.common.near_dedup import near_dedup
 from src.common.pii import PIIDetector
-from .policy_engine import PolicyEngine, Decision
+
+from .policy_engine import PolicyEngine
+from .registry import (
+    RegistryError,
+    load_registry,
+    validate_sample_against_registry,
+)
+
+# Stage order matters: a sample advances only if the previous stage passed.
+STAGES = (
+    "input",
+    "schema_pass",
+    "registry_pass",
+    "pii_masked",
+    "policy_pass",
+    "role_pass",
+    "quality_pass",
+    "review_pass",
+    "exact_dedup_removed",
+    "near_dedup_removed",
+    "final",
+)
+
+
+# ---------------------------------------------------------------------------
+# Stats / reporting
+# ---------------------------------------------------------------------------
 
 
 @dataclass
-class ProcessingStats:
-    """Statistics for data processing pipeline."""
-    input_count: int = 0
-    schema_valid: int = 0
-    pii_masked: int = 0
-    policy_consistent: int = 0
-    role_valid: int = 0
-    quality_passed: int = 0
-    exact_dedup_removed: int = 0
-    near_dedup_removed: int = 0
-    final_count: int = 0
-    
-    reasons: Dict[str, int] = field(default_factory=dict)
-    
+class StageStats:
+    """Funnel statistics where each entry counts the *cumulative* survivors
+    of that stage (i.e. those samples that passed every prior stage).
+    """
+
+    counts: dict[str, int] = field(default_factory=dict)
+    rejections: list[dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        for stage in STAGES:
+            self.counts.setdefault(stage, 0)
+
     def to_dict(self) -> dict:
         return {
-            "input_count": self.input_count,
-            "schema_valid": self.schema_valid,
-            "pii_masked": self.pii_masked,
-            "policy_consistent": self.policy_consistent,
-            "role_valid": self.role_valid,
-            "quality_passed": self.quality_passed,
-            "exact_dedup_removed": self.exact_dedup_removed,
-            "near_dedup_removed": self.near_dedup_removed,
-            "final_count": self.final_count,
-            "reasons": self.reasons,
-            "funnel": {
-                "schema_valid_rate": f"{self.schema_valid/self.input_count*100:.1f}%" if self.input_count else "N/A",
-                "pii_rate": f"{self.pii_masked/self.schema_valid*100:.1f}%" if self.schema_valid else "N/A",
-                "quality_pass_rate": f"{self.quality_passed/self.role_valid*100:.1f}%" if self.role_valid else "N/A",
-                "dedup_rate": f"{(self.exact_dedup_removed+self.near_dedup_removed)/self.quality_passed*100:.1f}%" if self.quality_passed else "N/A",
-            }
+            "stage_counts": self.counts,
+            "rejection_summary": _summary_rejections(self.rejections),
         }
 
 
-class DataPipeline:
+def _summary_rejections(rejections: list[dict[str, Any]]) -> dict[str, int]:
+    summary: dict[str, int] = defaultdict(int)
+    for r in rejections:
+        summary[r["stage"]] += 1
+    return dict(summary)
+
+
+# ---------------------------------------------------------------------------
+# Validators
+# ---------------------------------------------------------------------------
+
+
+ALLOWED_ROLES = {"system", "user", "assistant"}
+
+
+def validate_schema(sample: dict[str, Any]) -> str | None:
+    """Return None if OK, else error message."""
+    for required in ("sample_id", "messages", "intent", "decision", "policy_ids"):
+        if required not in sample:
+            return f"missing field {required!r}"
+    if not isinstance(sample["messages"], list) or not sample["messages"]:
+        return "messages must be non-empty list"
+    if not isinstance(sample["policy_ids"], list):
+        return "policy_ids must be list"
+    return None
+
+
+def validate_role_order(sample: dict[str, Any]) -> str | None:
+    """Validate role sequence: starts with system or user; user/assistant alternation."""
+    messages = sample["messages"]
+    first = messages[0].get("role")
+    if first not in {"system", "user"}:
+        return f"first message must be system or user, got {first!r}"
+    last_role = None
+    saw_user = False
+    for m in messages:
+        role = m.get("role")
+        if role not in ALLOWED_ROLES:
+            return f"invalid role {role!r}"
+        if role == "user":
+            saw_user = True
+        if last_role == "assistant" and role == "assistant":
+            return "consecutive assistant messages"
+        if role != "system" and role == last_role:
+            return f"non-system role {role!r} repeats"
+        last_role = role
+    if not saw_user:
+        return "no user turn"
+    if last_role != "assistant":
+        return "last message must be assistant"
+    return None
+
+
+def validate_review(sample: dict[str, Any], mode: str) -> str | None:
+    review = sample.get("review_status", "pending")
+    if mode == "fixture":
+        if review not in {"auto_validated", "human_approved"}:
+            return f"fixture mode requires review_status in {{auto_validated, human_approved}}, got {review!r}"
+    elif mode == "training_release":
+        if review != "human_approved":
+            return f"training_release requires human_approved, got {review!r}"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Splits
+# ---------------------------------------------------------------------------
+
+
+DEFAULT_SPLIT_RATIOS = {"train": 0.7, "dev": 0.15, "test": 0.15}
+
+
+def _group_id(sample: dict[str, Any]) -> str:
+    """Group sample by union of (parent_case_id, template_family).
+
+    Note: we deliberately omit ``dedup_cluster_id`` from the group key, so
+    all rewrite strategies of the same canonical case remain in the same
+    group and never leak across splits.
     """
-    Complete data processing pipeline for e-commerce training data.
-    """
-    
-    REQUIRED_FIELDS = [
-        "sample_id", "messages", "intent", "slots", "policy_ids",
-        "decision", "requires_human"
+    parts = [
+        sample.get("parent_case_id", ""),
+        sample.get("template_family", ""),
     ]
-    
-    VALID_ROLES = {"system", "user", "assistant"}
-    
-    def __init__(self, policies: Optional[List[Dict]] = None, seed: int = 42):
-        self.policies = policies
-        self.policy_engine = PolicyEngine(policies) if policies else None
-        self.pii_detector = PIIDetector()
-        self.stats = ProcessingStats()
-        self.seed = seed
-        
-        # Deduplication state
-        self.exact_hashes: Set[str] = set()
-        self.near_dedup_clusters: Dict[str, List[str]] = defaultdict(list)
-    
-    def process(
-        self,
-        input_path: str,
-        output_dir: str,
-        train_ratio: float = 0.8,
-        dev_ratio: float = 0.1,
-        test_ratio: float = 0.1,
-    ) -> Dict[str, List[Dict]]:
-        """
-        Process input data through the complete pipeline.
-        
-        Returns:
-            Dict with keys: train, dev, test
-        """
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-        
-        # Load input data
-        samples = self._load_samples(input_path)
-        self.stats.input_count = len(samples)
-        
-        print(f"Loaded {len(samples)} samples")
-        
-        # Process each stage
-        valid_samples = []
-        quarantine_samples = []
-        
-        for sample in samples:
-            result = self._process_sample(sample)
-            if result["valid"]:
-                valid_samples.append(result["sample"])
-            else:
-                quarantine_samples.append((sample, result.get("reason", "unknown")))
-                self.stats.reasons[result.get("reason", "unknown")] = \
-                    self.stats.reasons.get(result.get("reason", "unknown"), 0) + 1
-        
-        print(f"Schema valid: {len(valid_samples)}")
-        self.stats.schema_valid = len(valid_samples)
-        
-        # Deduplicate
-        unique_samples, exact_dup_count = self._exact_dedup(valid_samples)
-        self.stats.exact_dedup_removed = exact_dup_count
-        print(f"After exact dedup: {len(unique_samples)} (removed {exact_dup_count})")
-        
-        # Near dedup
-        final_samples, near_dup_count = self._near_dedup(unique_samples)
-        self.stats.near_dedup_removed = near_dup_count
-        print(f"After near dedup: {len(final_samples)} (removed {near_dup_count})")
-        
-        self.stats.final_count = len(final_samples)
-        
-        # Split
-        splits = self._split_data(final_samples, train_ratio, dev_ratio, test_ratio)
-        
-        # Save outputs
-        self._save_splits(splits, output_dir)
-        
-        # Save quarantine samples
-        if quarantine_samples:
-            q_path = Path(output_dir) / "quarantine.jsonl"
-            with open(q_path, 'w', encoding='utf-8') as f:
-                for sample, reason in quarantine_samples:
-                    f.write(json.dumps({
-                        "sample": sample,
-                        "quarantine_reason": reason
-                    }, ensure_ascii=False) + '\n')
-            print(f"Quarantine samples saved to {q_path}")
-        
-        # Save stats
-        self._save_stats(output_dir)
-        
-        return splits
-    
-    def _load_samples(self, input_path: str) -> List[Dict]:
-        """Load samples from JSONL file."""
-        samples = []
-        with open(input_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                samples.append(json.loads(line))
-        return samples
-    
-    def _process_sample(self, sample: Dict) -> Dict[str, Any]:
-        """Process a single sample through all stages."""
-        # Stage 1: Schema validation
-        if not self._validate_schema(sample):
-            return {"valid": False, "reason": "schema_invalid"}
-        self.stats.schema_valid += 1
-        
-        # Stage 2: PII scan/mask
-        masked_sample = self._mask_pii(sample)
-        if masked_sample != sample:
-            self.stats.pii_masked += 1
-            sample = masked_sample
-            sample["pii_status"] = "masked"
-        
-        # Stage 3: Policy consistency
-        if self.policy_engine and not self._validate_policy(sample):
-            return {"valid": False, "reason": "policy_inconsistent"}
-        self.stats.policy_consistent += 1
-        
-        # Stage 4: Role validation
-        if not self._validate_roles(sample):
-            return {"valid": False, "reason": "invalid_roles"}
-        self.stats.role_valid += 1
-        
-        # Stage 5: Quality filtering
-        if not self._check_quality(sample):
-            return {"valid": False, "reason": "quality_failed"}
-        self.stats.quality_passed += 1
-        
-        return {"valid": True, "sample": sample}
-    
-    def _validate_schema(self, sample: Dict) -> bool:
-        """Validate sample has required fields."""
-        for field in self.REQUIRED_FIELDS:
-            if field not in sample:
-                return False
-        
-        # Validate messages
-        if not isinstance(sample.get("messages"), list):
-            return False
-        if len(sample["messages"]) < 2:
-            return False
-        
-        # Validate message structure
-        for msg in sample["messages"]:
-            if not isinstance(msg, dict):
-                return False
-            if "role" not in msg or "content" not in msg:
-                return False
-        
-        return True
-    
-    def _mask_pii(self, sample: Dict) -> Dict:
-        """Mask PII in all messages."""
-        masked_sample = dict(sample)
-        messages = []
-        
-        for msg in sample["messages"]:
-            masked_msg = dict(msg)
-            if msg["role"] != "system":
-                masked_text, matches = self.pii_detector.mask(msg["content"])
-                masked_msg["content"] = masked_text
-                if matches:
-                    masked_msg["pii_detected"] = [m.pii_type for m in matches]
-            messages.append(masked_msg)
-        
-        masked_sample["messages"] = messages
-        return masked_sample
-    
-    def _validate_policy(self, sample: Dict) -> bool:
-        """Validate policy consistency."""
-        if not self.policy_engine:
-            return True
-        
-        # Match against policy engine
-        match = self.policy_engine.match(sample.get("slots", {}))
-        
-        expected_decision = sample.get("decision", "")
-        actual_decision = match.decision.value
-        
-        # Allow minor discrepancies
-        if expected_decision != actual_decision:
-            return False
-        
-        return True
-    
-    def _validate_roles(self, sample: Dict) -> bool:
-        """Validate message roles are valid and in order."""
-        roles = [msg.get("role") for msg in sample.get("messages", [])]
-        
-        # All roles must be valid
-        for role in roles:
-            if role not in self.VALID_ROLES:
-                return False
-        
-        # Must start with user or system
-        if roles[0] not in ["user", "system"]:
-            return False
-        
-        # Must have at least one assistant turn
-        if "assistant" not in roles:
-            return False
-        
-        return True
-    
-    def _check_quality(self, sample: Dict) -> bool:
-        """Check sample passes quality filters."""
-        messages = sample.get("messages", [])
-        
-        for msg in messages:
-            content = msg.get("content", "")
-            
-            # Check for empty content
-            if not content.strip():
-                return False
-            
-            # Check for extreme length (too short or too long)
-            if len(content) > 10000:
-                return False
-            
-            # Check for repetitive patterns
-            if self._is_repetitive(content):
-                return False
-        
-        # Check for message count
-        if len(messages) > 20:
-            return False
-        
-        return True
-    
-    def _is_repetitive(self, text: str, threshold: float = 0.7) -> bool:
-        """Check if text is overly repetitive."""
-        if len(text) < 50:
-            return False
-        
-        # Simple check: if same 3-gram appears > threshold times
-        ngrams = [text[i:i+3] for i in range(len(text)-2)]
-        if not ngrams:
-            return False
-        
-        ngram_counts = defaultdict(int)
-        for ng in ngrams:
-            ngram_counts[ng] += 1
-        
-        max_count = max(ngram_counts.values()) if ngram_counts else 0
-        if max_count / len(ngrams) > threshold:
-            return True
-        
-        return False
-    
-    def _exact_dedup(self, samples: List[Dict]) -> tuple:
-        """Exact deduplication using normalized text hash."""
-        unique = []
-        removed = 0
-        
-        for sample in samples:
-            # Compute hash of normalized messages
-            messages = sample.get("messages", [])
-            normalized = "".join(m.get("content", "") for m in messages)
-            normalized = re.sub(r'\s+', '', normalized.lower())
-            
-            hash_val = hashlib.sha256(normalized.encode()).hexdigest()[:16]
-            
-            if hash_val not in self.exact_hashes:
-                self.exact_hashes.add(hash_val)
-                sample["_dedup_hash"] = hash_val
-                unique.append(sample)
-            else:
-                removed += 1
-        
-        return unique, removed
-    
-    def _near_dedup(self, samples: List[Dict], threshold: float = 0.95) -> tuple:
-        """Near deduplication using simple n-gram similarity."""
-        # Simple implementation: group by intent + template_family
-        clusters: Dict[str, List[Dict]] = defaultdict(list)
-        
-        for sample in samples:
-            key = f"{sample.get('intent', '')}_{sample.get('template_family', '')}"
-            clusters[key].append(sample)
-        
-        unique = []
-        removed = 0
-        
-        for cluster_key, cluster_samples in clusters.items():
-            # Keep first, mark rest for removal
-            if len(cluster_samples) > 1:
-                unique.append(cluster_samples[0])
-                removed += len(cluster_samples) - 1
-                cluster_samples[0]["dedup_cluster_id"] = cluster_key
-                
-                for s in cluster_samples[1:]:
-                    s["dedup_cluster_id"] = cluster_key
-            else:
-                unique.append(cluster_samples[0])
-        
-        return unique, removed
-    
-    def _split_data(
-        self,
-        samples: List[Dict],
-        train_ratio: float,
-        dev_ratio: float,
-        test_ratio: float,
-    ) -> Dict[str, List[Dict]]:
-        """
-        Split data into train/dev/test.
-        
-        Uses stratified split by intent to avoid imbalance.
-        """
-        # Group by intent
-        by_intent: Dict[str, List[Dict]] = defaultdict(list)
-        for sample in samples:
-            intent = sample.get("intent", "unknown")
-            by_intent[intent].append(sample)
-        
-        splits: Dict[str, List[Dict]] = {"train": [], "dev": [], "test": []}
-        
-        for intent, intent_samples in by_intent.items():
-            n = len(intent_samples)
-            
-            # Calculate split sizes
-            n_train = int(n * train_ratio)
-            n_dev = int(n * dev_ratio)
-            
-            # Shuffle deterministically
-            import random
-            random.seed(self.seed + hash(intent) % 1000)
-            random.shuffle(intent_samples)
-            
-            # Assign
-            splits["train"].extend(intent_samples[:n_train])
-            splits["dev"].extend(intent_samples[n_train:n_train+n_dev])
-            splits["test"].extend(intent_samples[n_train+n_dev:])
-            
-            # Mark split
-            for i, s in enumerate(intent_samples):
-                if i < n_train:
-                    s["split"] = "train"
-                elif i < n_train + n_dev:
-                    s["split"] = "dev"
-                else:
-                    s["split"] = "test"
-        
-        # Remove internal fields
-        for split_name in splits:
-            for sample in splits[split_name]:
-                sample.pop("_dedup_hash", None)
-        
-        return splits
-    
-    def _save_splits(self, splits: Dict[str, List[Dict]], output_dir: str):
-        """Save splits to JSONL files."""
-        for split_name, samples in splits.items():
-            path = Path(output_dir) / f"{split_name}.jsonl"
-            with open(path, 'w', encoding='utf-8') as f:
-                for sample in samples:
-                    f.write(json.dumps(sample, ensure_ascii=False) + '\n')
-            print(f"Saved {split_name}: {len(samples)} samples to {path}")
-    
-    def _save_stats(self, output_dir: str):
-        """Save processing statistics."""
-        # JSON report
-        stats_path = Path(output_dir) / "processing_stats.json"
-        with open(stats_path, 'w', encoding='utf-8') as f:
-            json.dump(self.stats.to_dict(), f, ensure_ascii=False, indent=2)
-        
-        # Markdown report
-        md_path = Path(output_dir) / "processing_report.md"
-        with open(md_path, 'w', encoding='utf-8') as f:
-            f.write("# Data Processing Report\n\n")
-            f.write(f"## Summary\n\n")
-            f.write(f"- Input samples: {self.stats.input_count}\n")
-            f.write(f"- Final samples: {self.stats.final_count}\n")
-            f.write(f"- Overall retention: {self.stats.final_count/self.stats.input_count*100:.1f}%\n\n")
-            
-            f.write(f"## Funnel\n\n")
-            f.write("| Stage | Count | Rate |\n")
-            f.write("|-------|-------|------|\n")
-            f.write(f"| Input | {self.stats.input_count} | 100% |\n")
-            f.write(f"| Schema Valid | {self.stats.schema_valid} | {self.stats.to_dict()['funnel']['schema_valid_rate']} |\n")
-            f.write(f"| PII Masked | {self.stats.pii_masked} | {self.stats.to_dict()['funnel']['pii_rate']} |\n")
-            f.write(f"| Quality Passed | {self.stats.quality_passed} | {self.stats.to_dict()['funnel']['quality_pass_rate']} |\n")
-            f.write(f"| After Dedup | {self.stats.final_count} | {self.stats.to_dict()['funnel']['dedup_rate']} |\n\n")
-            
-            if self.stats.reasons:
-                f.write(f"## Quarantine Reasons\n\n")
-                for reason, count in sorted(self.stats.reasons.items()):
-                    f.write(f"- {reason}: {count}\n")
+    if not any(parts):
+        return "group_" + Hashing.short("group", sample.get("sample_id", ""), length=16)
+    return "g_" + Hashing.short("group", *parts, length=20)
+
+
+def stratified_group_split(
+    samples: list[dict[str, Any]],
+    seed: int,
+    ratios: dict[str, float] = None,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
+    """Split samples by group, stratifying by intent.
+
+    Algorithm:
+    - Group samples by ``_group_id(sample)``.
+    - Sort groups by stable (intent, group_id) and walk through them,
+      placing each entire group into the smallest split first, subject to
+      the ratio (with a small tolerance).
+    - Within a split, sort samples by ``sample_id`` for stable output order.
+    """
+    if ratios is None:
+        ratios = DEFAULT_SPLIT_RATIOS
+    total = sum(ratios.values())
+    if abs(total - 1.0) > 1e-6:
+        raise ValueError(f"split ratios must sum to 1, got {total}")
+
+    splits: dict[str, list[dict[str, Any]]] = {"train": [], "dev": [], "test": []}
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    intent_of_group: dict[str, str] = {}
+    for sample in samples:
+        gid = _group_id(sample)
+        groups[gid].append(sample)
+        intent_of_group.setdefault(gid, sample.get("intent", "unknown"))
+
+    # Order groups by stable (intent, group_id) so it's deterministic.
+    sorted_groups = sorted(
+        groups.keys(),
+        key=lambda g: (intent_of_group[g], g),
+    )
+
+    # Allocate targets by ratio of total groups
+    n = len(sorted_groups)
+    if n < 3:
+        target = {"train": max(1, n - 2), "dev": 1, "test": 1}
+    else:
+        # Reserve dev and test using the requested ratios; the rest go to train.
+        target_dev = max(1, int(round(ratios["dev"] * n)))
+        target_test = max(1, int(round(ratios["test"] * n)))
+        if target_dev + target_test >= n:
+            target_dev = max(1, n // 3)
+            target_test = max(1, n // 3)
+        target = {"train": n - target_dev - target_test, "dev": target_dev, "test": target_test}
+
+    # Track intent counts per split to balance stratification.
+    intent_counts = {k: defaultdict(int) for k in splits}
+
+    placed: dict[str, str] = {}
+    ordered_groups = list(sorted_groups)
+    target_dev = target["dev"]
+    target_test = target["test"]
+
+    # Interleave dev/test picks by alternating across the stable order so each
+    # non-train split gets balanced intent coverage. Remaining groups go to
+    # train so that train is by construction the largest split.
+    dev_picks: list[str] = []
+    test_picks: list[str] = []
+    for i, gid in enumerate(ordered_groups):
+        if len(dev_picks) < target_dev and i % 2 == 0:
+            dev_picks.append(gid)
+        elif len(test_picks) < target_test and i % 2 == 1:
+            test_picks.append(gid)
+        elif len(dev_picks) < target_dev:
+            dev_picks.append(gid)
+        elif len(test_picks) < target_test:
+            test_picks.append(gid)
+
+    for gid in dev_picks:
+        splits["dev"].extend(groups[gid])
+        intent_counts["dev"][intent_of_group[gid]] += 1
+        placed[gid] = "dev"
+    for gid in test_picks:
+        if gid in placed:
+            continue
+        splits["test"].extend(groups[gid])
+        intent_counts["test"][intent_of_group[gid]] += 1
+        placed[gid] = "test"
+    for gid in ordered_groups:
+        if gid in placed:
+            continue
+        splits["train"].extend(groups[gid])
+        intent_counts["train"][intent_of_group[gid]] += 1
+        placed[gid] = "train"
+
+    # Sort samples inside each split by sample_id for stable ordering.
+    for k in splits:
+        splits[k] = sorted(splits[k], key=lambda s: s["sample_id"])
+
+    manifest = {
+        "algorithm": "stratified_group_v1",
+        "seed": seed,
+        "ratios": ratios,
+        "total_groups": len(groups),
+        "total_samples": len(samples),
+        "split_sizes": {k: len(v) for k, v in splits.items()},
+        "split_group_counts": {
+            k: sum(1 for s in v for gid in [placed.get(_group_id(s))]
+                   if gid)
+            for k, v in splits.items()
+        },
+        "split_intent_counts": {
+            k: dict(intent_counts[k]) for k in splits
+        },
+    }
+    return splits, manifest
+
+
+def check_leakage(
+    splits: dict[str, list[dict[str, Any]]],
+) -> tuple[bool, list[dict[str, Any]]]:
+    """Verify that no group / dedup_cluster_id appears in more than one split."""
+    group_to_split: dict[str, str] = {}
+    cluster_to_split: dict[str, str] = {}
+    leaks: list[dict[str, Any]] = []
+    for split_name, samples in splits.items():
+        for s in samples:
+            gid = _group_id(s)
+            cid = s.get("dedup_cluster_id")
+            if gid in group_to_split and group_to_split[gid] != split_name:
+                leaks.append({"type": "group", "id": gid, "splits": [group_to_split[gid], split_name]})
+            group_to_split[gid] = split_name
+            if cid:
+                if cid in cluster_to_split and cluster_to_split[cid] != split_name:
+                    leaks.append({"type": "dedup_cluster", "id": cid, "splits": [cluster_to_split[cid], split_name]})
+                cluster_to_split[cid] = split_name
+    return (len(leaks) == 0, leaks)
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PipelineConfig:
+    near_dedup_threshold: float = 0.7
+    seed: int = 42
+    mode: str = "fixture"  # "fixture" or "training_release"
+    split_ratios: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_SPLIT_RATIOS))
 
 
 def run_pipeline(
-    input_path: str = "data/processed/fixtures/conversations.jsonl",
-    output_dir: str = "data/processed/fixtures/release_v1",
-    policies_path: str = "data/processed/fixtures/policies.json",
-    seed: int = 42,
-):
-    """Run the complete data pipeline."""
-    # Load policies
-    policies = None
-    if Path(policies_path).exists():
-        with open(policies_path, 'r', encoding='utf-8') as f:
-            policies = json.load(f)
-    
-    # Run pipeline
-    pipeline = DataPipeline(policies=policies, seed=seed)
-    splits = pipeline.process(
-        input_path=input_path,
-        output_dir=output_dir,
-        train_ratio=0.8,
-        dev_ratio=0.1,
-        test_ratio=0.1,
+    conversations_path: str,
+    policies_path: str,
+    registry_path: str,
+    output_dir: str,
+    config: PipelineConfig,
+) -> dict[str, Any]:
+    """Run the full data funnel. Returns a structured report dict."""
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    with open(policies_path, encoding='utf-8') as f:
+        policies = json.load(f)
+    engine = PolicyEngine(policies)
+
+    if Path(registry_path).exists():
+        try:
+            registry = load_registry(registry_path)
+        except Exception as exc:
+            raise RegistryError(f"failed to load registry: {exc}") from exc
+    else:
+        registry = {}
+
+    samples_in = _load_jsonl(conversations_path)
+    stats = StageStats()
+    stats.counts["input"] = len(samples_in)
+
+    survived: list[dict[str, Any]] = []
+    for sample in samples_in:
+        err = validate_schema(sample)
+        if err:
+            stats.rejections.append({"sample_id": sample.get("sample_id", "<unknown>"), "stage": "schema_pass", "reason": err})
+            continue
+        stats.counts["schema_pass"] += 1
+
+        source_id = sample.get("source_id", "")
+        entry = registry.get(source_id)
+        if entry is None:
+            stats.rejections.append({"sample_id": sample["sample_id"], "stage": "registry_pass", "reason": f"unknown source {source_id!r}"})
+            continue
+        err = validate_sample_against_registry(sample, entry, mode=config.mode)
+        if err:
+            stats.rejections.append({"sample_id": sample["sample_id"], "stage": "registry_pass", "reason": err})
+            continue
+        stats.counts["registry_pass"] += 1
+
+        # PII scan + mask
+        pii = PIIDetector()
+        any_pii = False
+        for msg in sample["messages"]:
+            text = msg.get("content", "")
+            masked, spans = pii.mask(text)
+            if spans:
+                any_pii = True
+                msg["content"] = masked
+        if any_pii:
+            sample["pii_status"] = "masked"
+        else:
+            sample["pii_status"] = "passed"
+        stats.counts["pii_masked"] += 1
+
+        # Policy consistency (only when expected_policy_ids is non-empty)
+        if sample.get("policy_ids"):
+            match = engine.match(
+                sample.get("slots") or {},
+                category_hint=sample.get("category_hint"),
+            )
+            if match.policy_id and match.policy_id not in sample["policy_ids"]:
+                stats.rejections.append({"sample_id": sample["sample_id"], "stage": "policy_pass", "reason": f"policy mismatch with engine: {match.policy_id}", "kind": "policy_inconsistent"})
+                continue
+            if match.decision.value != sample.get("decision"):
+                stats.rejections.append({"sample_id": sample["sample_id"], "stage": "policy_pass", "reason": f"decision mismatch: engine={match.decision.value} sample={sample.get('decision')}", "kind": "policy_inconsistent"})
+                continue
+        stats.counts["policy_pass"] += 1
+
+        err = validate_role_order(sample)
+        if err:
+            stats.rejections.append({"sample_id": sample["sample_id"], "stage": "role_pass", "reason": err, "kind": "invalid_roles"})
+            continue
+        stats.counts["role_pass"] += 1
+
+        # Quality (placeholder for richer rules; reject empty user/assistant content)
+        quality_ok = True
+        for msg in sample["messages"]:
+            content = (msg.get("content") or "").strip()
+            if not content:
+                quality_ok = False
+                break
+        if not quality_ok:
+            stats.rejections.append({"sample_id": sample["sample_id"], "stage": "quality_pass", "reason": "empty content"})
+            continue
+        stats.counts["quality_pass"] += 1
+
+        # Review mode gate
+        err = validate_review(sample, config.mode)
+        if err:
+            stats.rejections.append({"sample_id": sample["sample_id"], "stage": "review_pass", "reason": err})
+            continue
+        stats.counts["review_pass"] += 1
+
+        survived.append(sample)
+
+    # Exact dedup by canonicalized user text
+    seen: dict[str, str] = {}
+    survivors: list[dict[str, Any]] = []
+    for sample in survived:
+        from src.common.near_dedup import normalize_text
+        text = normalize_text(_user_business_text(sample))
+        if not text:
+            survivors.append(sample)
+            continue
+        if text in seen:
+            stats.rejections.append({
+                "sample_id": sample["sample_id"],
+                "stage": "exact_dedup_removed",
+                "reason": f"duplicate of {seen[text]}",
+            })
+            stats.counts["exact_dedup_removed"] += 1
+            continue
+        seen[text] = sample["sample_id"]
+        survivors.append(sample)
+
+    # Near dedup
+    near_result = near_dedup(survivors, threshold=config.near_dedup_threshold)
+    near_removed_ids = {item["sample_id"] for item in near_result.near_removed}
+    near_quarantined_ids = {item["sample_id"] for item in near_result.quarantined}
+
+    kept_for_split: list[dict[str, Any]] = []
+    for s in survivors:
+        if s["sample_id"] in near_removed_ids or s["sample_id"] in near_quarantined_ids:
+            stats.rejections.append({
+                "sample_id": s["sample_id"],
+                "stage": "near_dedup_removed",
+                "reason": "near_dup_quarantine" if s["sample_id"] in near_quarantined_ids else "near_dup",
+            })
+            stats.counts["near_dedup_removed"] += 1
+            continue
+        kept_for_split.append(s)
+
+    # Compute final counts
+    splits, split_manifest = stratified_group_split(
+        kept_for_split,
+        seed=config.seed,
+        ratios=config.split_ratios,
     )
-    
-    return splits
+
+    splits_total = sum(len(v) for v in splits.values())
+    stats.counts["final"] = splits_total
+
+    # Write splits
+    _write_jsonl(Path(output_dir) / "train.jsonl", splits["train"])
+    _write_jsonl(Path(output_dir) / "dev.jsonl", splits["dev"])
+    _write_jsonl(Path(output_dir) / "test.jsonl", splits["test"])
+    _write_jsonl(Path(output_dir) / "quarantine.jsonl", [
+        {**next((s for s in survivors if s["sample_id"] == item["sample_id"]), item), **{"drop_reason": item.get("reason", "")}}
+        for item in near_result.quarantined
+    ])
+
+    # Leakage
+    leak_ok, leaks = check_leakage(splits)
+    leakage_report = {
+        "no_leakage": leak_ok,
+        "leak_count": len(leaks),
+        "leaks": leaks[:20],  # cap for visibility
+    }
+    with open(Path(output_dir) / "leakage_report.json", 'w', encoding='utf-8') as f:
+        json.dump(leakage_report, f, ensure_ascii=False, indent=2)
+    # Markdown summary
+    md_lines = [
+        "# Leakage Report",
+        "",
+        f"- no_leakage: {leak_ok}",
+        f"- leak_count: {len(leaks)}",
+    ]
+    if leaks:
+        md_lines.append("\n## Sample leaks (first 20)\n")
+        for lk in leaks[:20]:
+            md_lines.append(f"- {lk['type']} {lk['id']} spans {lk['splits']}")
+    with open(Path(output_dir) / "leakage_report.md", 'w', encoding='utf-8') as f:
+        f.write("\n".join(md_lines) + "\n")
+
+    # Manifest
+    manifest = {
+        "algorithm_version": split_manifest["algorithm"],
+        "seed": split_manifest["seed"],
+        "ratios": split_manifest["ratios"],
+        "input_hash": _hash_jsonl(conversations_path),
+        "total_samples": split_manifest["total_samples"],
+        "total_groups": split_manifest["total_groups"],
+        "splits": {
+            k: {
+                "sample_ids": [s["sample_id"] for s in v],
+                "group_ids": sorted({_group_id(s) for s in v}),
+                "intent_counts": dict(split_manifest["split_intent_counts"][k]),
+            }
+            for k, v in splits.items()
+        },
+    }
+    with open(Path(output_dir) / "split_manifest.json", 'w', encoding='utf-8') as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+    # Funnel report
+    funnel = {
+        "stage_counts": stats.counts,
+        "rejection_summary": _summary_rejections(stats.rejections),
+        "invalid_roles": sum(1 for r in stats.rejections if r.get("kind") == "invalid_roles"),
+        "policy_inconsistent": sum(1 for r in stats.rejections if r.get("kind") == "policy_inconsistent"),
+        "near_dedup": near_result.stats,
+        "leakage": {"no_leakage": leak_ok, "leak_count": len(leaks)},
+        "split_manifest": manifest,
+    }
+    with open(Path(output_dir) / "funnel_report.json", 'w', encoding='utf-8') as f:
+        json.dump(funnel, f, ensure_ascii=False, indent=2)
+    with open(Path(output_dir) / "funnel_report.md", 'w', encoding='utf-8') as f:
+        f.write("# Funnel Report\n\n")
+        f.write("## Stage counts\n\n")
+        for stage in STAGES:
+            f.write(f"- {stage}: {stats.counts.get(stage, 0)}\n")
+        f.write("\n## Rejections\n\n")
+        for stage, count in _summary_rejections(stats.rejections).items():
+            f.write(f"- {stage}: {count}\n")
+
+    # Exit code: only fail if leakage detected and on training_release
+    exit_ok = True
+    if not leak_ok and config.mode == "training_release":
+        exit_ok = False
+    return {"funnel": funnel, "exit_ok": exit_ok}
 
 
-def main():
-    """CLI entry point."""
-    parser = argparse.ArgumentParser(
-        description="Run data processing pipeline"
-    )
-    parser.add_argument(
-        "--input", "-i",
-        type=str,
-        default="data/processed/fixtures/conversations.jsonl",
-        help="Input conversations JSONL"
-    )
-    parser.add_argument(
-        "--output", "-o",
-        type=str,
-        default="data/processed/fixtures/release_v1",
-        help="Output directory"
-    )
-    parser.add_argument(
-        "--policies",
-        type=str,
-        default="data/processed/fixtures/policies.json",
-        help="Policies JSON for validation"
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed"
-    )
-    
+def _user_business_text(sample: dict[str, Any]) -> str:
+    from src.common.near_dedup import extract_user_business_text
+    return extract_user_business_text(sample)
+
+
+def _load_jsonl(path: str) -> list[dict[str, Any]]:
+    with open(path, encoding='utf-8') as f:
+        return [json.loads(line) for line in f]
+
+
+def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
+    with open(path, 'w', encoding='utf-8') as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + '\n')
+
+
+def _hash_jsonl(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Backward-compat alias
+# ---------------------------------------------------------------------------
+
+
+class DataPipeline:  # pragma: no cover - thin wrapper
+    """Deprecated alias for the module-level ``run_pipeline`` function.
+
+    Existing tests used ``DataPipeline(...).run()``; keep that working.
+    """
+
+    def __init__(
+        self,
+        policies_path: str,
+        registry_path: str,
+        output_dir: str,
+        seed: int = 42,
+        mode: str = "fixture",
+        near_dedup_threshold: float = 0.7,
+        split_ratios: dict[str, float] | None = None,
+    ):
+        self.config = PipelineConfig(
+            near_dedup_threshold=near_dedup_threshold,
+            seed=seed,
+            mode=mode,
+            split_ratios=split_ratios or dict(DEFAULT_SPLIT_RATIOS),
+        )
+        self.policies_path = policies_path
+        self.registry_path = registry_path
+        self.output_dir = output_dir
+
+    def run(self, conversations_path: str) -> dict[str, Any]:
+        return run_pipeline(
+            conversations_path,
+            self.policies_path,
+            self.registry_path,
+            self.output_dir,
+            self.config,
+        )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="E-commerce data pipeline")
+    parser.add_argument("--input", required=True, help="Conversations JSONL")
+    parser.add_argument("--policies", required=True, help="Policies JSON")
+    parser.add_argument("--registry", required=True, help="Registry JSON")
+    parser.add_argument("--output", required=True, help="Output directory")
+    parser.add_argument("--mode", choices=["fixture", "training_release"], default="fixture")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--near-dedup-threshold", type=float, default=0.7)
+    parser.add_argument("--ratios", type=str, default="0.7,0.15,0.15", help="train,dev,test ratios")
     args = parser.parse_args()
-    
-    splits = run_pipeline(
-        input_path=args.input,
-        output_dir=args.output,
-        policies_path=args.policies,
+
+    ratios = {}
+    parts = [p.strip() for p in args.ratios.split(",") if p.strip()]
+    if len(parts) != 3:
+        print("--ratios must be 3 numbers summing to 1")
+        return 2
+    ratios = {"train": float(parts[0]), "dev": float(parts[1]), "test": float(parts[2])}
+
+    config = PipelineConfig(
+        near_dedup_threshold=args.near_dedup_threshold,
         seed=args.seed,
+        mode=args.mode,
+        split_ratios=ratios,
     )
-    
-    print(f"\nPipeline complete!")
-    print(f"Train: {len(splits['train'])}")
-    print(f"Dev: {len(splits['dev'])}")
-    print(f"Test: {len(splits['test'])}")
-    
-    return 0
+
+    try:
+        report = run_pipeline(
+            args.input,
+            args.policies,
+            args.registry,
+            args.output,
+            config,
+        )
+    except RegistryError as exc:
+        print(f"Registry error: {exc}")
+        return 1
+
+    funnel = report["funnel"]
+    print("Stage counts:")
+    for stage in STAGES:
+        print(f"  {stage} = {funnel['stage_counts'].get(stage, 0)}")
+    print(f"invalid_roles = {funnel['invalid_roles']}")
+    print(f"policy_inconsistent = {funnel['policy_inconsistent']}")
+    print(f"leak_count = {funnel['leakage']['leak_count']}")
+    print("train/dev/test sizes:")
+    for k, v in funnel["split_manifest"]["splits"].items():
+        print(f"  {k}: {len(v['sample_ids'])}")
+    return 0 if report["exit_ok"] else 1
 
 
 if __name__ == "__main__":

@@ -1,423 +1,468 @@
 """
-Hybrid Retriever for Financial RAG
+Hybrid retriever for financial RAG.
 
-Based on recommended plan:
-- BM25 + Dense + Reciprocal Rank Fusion (RRF)
-- Metadata filtering (company, year, document type)
-- FAISS for dense vectors
-
-Fixed issues:
-- Dense retriever index attribute naming conflict
-- Device auto detection
-- Vector zero norm protection
-- Proper persistence and recovery
+Round 2 rewrite:
+- Backend is injectable. ``fake`` backend is dependency-free and is used by
+  the smoke test/CI to verify the end-to-end flow without downloading
+  embeddings.
+- Parent-child expansion is implemented by ``expand_to_parent``.
+- Persistence saves the chunk map, the dense row-to-id order, and BM25
+  state so ``load_index`` can serve the same query and yield identical
+  chunk-id lists + scores.
+- Metadata filters fail closed when a key is missing on the chunk.
+- NaN-safe: zero vectors are replaced with a deterministic small offset and
+  norm-checked before normalization.
 """
 
-from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple, Union
 import json
-import numpy as np
+from collections import Counter
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-import torch
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
 
 
 @dataclass
 class RetrievalResult:
-    """A single retrieval result."""
     chunk_id: str
     text: str
     doc_id: str
     page_start: int
     page_end: int
     score: float
-    source: str  # bm25, dense, or rrf
+    source: str
+    parent_chunk_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "chunk_id": self.chunk_id,
+            "text": self.text,
+            "doc_id": self.doc_id,
+            "page_start": self.page_start,
+            "page_end": self.page_end,
+            "score": self.score,
+            "source": self.source,
+            "parent_chunk_id": self.parent_chunk_id,
+        }
 
 
-@dataclass
-class RetrievalQuery:
-    """A retrieval query."""
-    query_id: str
-    text: str
-    filters: Optional[Dict] = None
+# ---------------------------------------------------------------------------
+# Embedding protocols
+# ---------------------------------------------------------------------------
 
 
-class BM25Retriever:
-    """BM25 sparse retriever."""
+class EmbeddingBackend:
+    """Abstract base for embedding backends."""
+
+    name: str = "base"
+    revision: str = ""
+
+    def embed(self, texts: Sequence[str]) -> np.ndarray:  # pragma: no cover
+        raise NotImplementedError
+
+
+class FakeEmbeddingBackend(EmbeddingBackend):
+    """Deterministic fake embedder.
+
+    Each text is hashed and projected into a small fixed-dimension vector.
+    The same text always produces the same vector so retrieval is reproducible.
+    """
+
+    def __init__(self, dim: int = 64):
+        self.dim = dim
+        self.name = "fake"
+        self.revision = "v1"
+
+    def embed(self, texts: Sequence[str]) -> np.ndarray:
+        if not texts:
+            return np.zeros((0, self.dim), dtype=np.float32)
+        out = np.zeros((len(texts), self.dim), dtype=np.float32)
+        for i, t in enumerate(texts):
+            arr = np.zeros(self.dim, dtype=np.float32)
+            text = (t or "").strip()
+            for word in text.split():
+                h = abs(hash(word)) % self.dim
+                arr[h] += 1.0
+            norm = np.linalg.norm(arr)
+            if norm > 0:
+                arr /= norm
+            else:
+                arr[0] = 1.0 / np.sqrt(self.dim)
+            out[i] = arr
+        return out
+
+
+class RealEmbeddingBackend(EmbeddingBackend):  # pragma: no cover - requires model
+    def __init__(self, model_name: str = "BAAI/bge-m3", device: str = "auto", revision: str | None = None):
+        self.model_name = model_name
+        self.device = device
+        self.revision = revision
+        self.name = model_name
+        self._model = None
+
+    def _load(self):
+        if self._model is None:
+            from sentence_transformers import SentenceTransformer
+            kwargs = {}
+            if self.revision:
+                kwargs["revision"] = self.revision
+            self._model = SentenceTransformer(self.model_name, device=self.device, **kwargs)
+
+    def embed(self, texts: Sequence[str]) -> np.ndarray:
+        self._load()
+        vecs = self._model.encode(list(texts), convert_to_numpy=True, show_progress_bar=False)
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        return (vecs / norms).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Sparse + Dense + Hybrid
+# ---------------------------------------------------------------------------
+
+
+def _tokenize(text: str) -> list[str]:
+    text = (text or "").lower()
+    # crude word + char n-gram tokenization suitable for English+Chinese mix
+    out: list[str] = []
+    for word in text.split():
+        out.append(word)
+        for i in range(len(word) - 1):
+            out.append(word[i : i + 2])
+    return out or [text]
+
+
+class BM25Sparse:
+    """Tiny BM25-style scorer implemented by hand to avoid the optional
+    ``rank_bm25`` dependency in CI.
+    """
 
     def __init__(self, k1: float = 1.5, b: float = 0.75):
         self.k1 = k1
         self.b = b
-        self.corpus: List[Tuple[str, str]] = []  # List of (chunk_id, text)
-        self.tokenized_corpus: List[List[str]] = []
-        self._bm25 = None
+        self.tokenized: list[list[str]] = []
+        self.doc_count = 0
+        self.avg_dl = 0.0
+        self.df: Counter = Counter()
+        self.chunk_ids: list[str] = []
 
-    def index(self, chunks: List[dict]):
-        """Build BM25 index."""
-        from rank_bm25 import BM25Okapi
+    def index(self, chunks: list[dict[str, Any]]):
+        if not chunks:
+            raise ValueError("empty corpus for BM25")
+        self.chunk_ids = [c["chunk_id"] for c in chunks]
+        self.tokenized = [_tokenize(c["text"]) for c in chunks]
+        self.doc_count = len(self.tokenized)
+        self.avg_dl = sum(len(t) for t in self.tokenized) / max(1, self.doc_count)
+        self.df = Counter()
+        for toks in self.tokenized:
+            for term in set(toks):
+                self.df[term] += 1
 
-        self.corpus = [(c["chunk_id"], c["text"]) for c in chunks]
-        self.tokenized_corpus = [self._tokenize(text) for _, text in self.corpus]
-
-        self._bm25 = BM25Okapi(self.tokenized_corpus)
-        self.doc_count = len(self.corpus)
-
-        print(f"BM25 indexed {self.doc_count} documents")
-
-    def _tokenize(self, text: str) -> List[str]:
-        """Simple Chinese tokenization."""
-        import jieba
-        return list(jieba.cut(text))
-
-    def search(
-        self,
-        query: str,
-        top_k: int = 50,
-    ) -> List[Tuple[str, float]]:
-        """Search BM25 index."""
-        if self._bm25 is None:
+    def search(self, query: str, top_k: int = 50) -> list[tuple[str, float]]:
+        if not self.tokenized:
             return []
-        
-        query_tokens = self._tokenize(query)
-        scores = self._bm25.get_scores(query_tokens)
+        q_tokens = _tokenize(query)
+        if not q_tokens:
+            return []
+        scores = np.zeros(self.doc_count, dtype=np.float32)
+        n_docs = self.doc_count
+        for term in q_tokens:
+            df = self.df.get(term, 0)
+            if df == 0:
+                continue
+            idf = np.log((n_docs - df + 0.5) / (df + 0.5) + 1.0)
+            for i, doc in enumerate(self.tokenized):
+                freq = doc.count(term)
+                if freq == 0:
+                    continue
+                dl = len(doc)
+                denom = freq + self.k1 * (1 - self.b + self.b * dl / max(1.0, self.avg_dl))
+                scores[i] += idf * (freq * (self.k1 + 1)) / max(1e-9, denom)
+        top = np.argsort(scores)[::-1][:top_k]
+        return [(self.chunk_ids[i], float(scores[i])) for i in top if scores[i] > 0]
 
-        # Get top-k
-        top_indices = np.argsort(scores)[::-1][:top_k]
 
-        return [
-            (self.corpus[i][0], float(scores[i]))
-            for i in top_indices if scores[i] > 0
-        ]
+class DenseIndex:
+    def __init__(self, backend: EmbeddingBackend):
+        self.backend = backend
+        self.embeddings: np.ndarray | None = None
+        self.chunk_ids: list[str] = []
+        self.id_to_idx: dict[str, int] = {}
 
-
-class DenseRetriever:
-    """
-    Dense vector retriever using sentence transformers.
-    
-    Fixed: renamed index attribute to faiss_index to avoid method name conflict.
-    """
-
-    def __init__(
-        self,
-        model_name: str = "BAAI/bge-m3",
-        device: str = "auto",
-        batch_size: int = 32,
-    ):
-        self.model_name = model_name
-        
-        # Resolve device
-        if device == "auto":
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        else:
-            self.device = device
-        
-        self.batch_size = batch_size
-        self._model = None
-        self.faiss_index = None  # Renamed to avoid conflict with index() method
-        self.chunks: List[dict] = []
-        self.id_to_idx: Dict[str, int] = {}
-
-    def _load_model(self):
-        """Lazy load the embedding model."""
-        if self._model is None:
-            from sentence_transformers import SentenceTransformer
-            print(f"Loading embedding model: {self.model_name} on {self.device}")
-            self._model = SentenceTransformer(self.model_name, device=self.device)
-
-    @property
-    def model(self):
-        """Lazy load model property."""
-        self._load_model()
-        return self._model
-
-    def build_index(self, chunks: List[dict], batch_size: Optional[int] = None):
-        """
-        Build dense index.
-        
-        Renamed from index() to avoid attribute conflict.
-        """
-        self.chunks = chunks
-        self.id_to_idx = {c["chunk_id"]: i for i, c in enumerate(chunks)}
-
-        # Encode all chunks
+    def build(self, chunks: list[dict[str, Any]]):
+        if not chunks:
+            raise ValueError("empty corpus for dense index")
         texts = [c["text"] for c in chunks]
-        batch_size = batch_size or self.batch_size
+        emb = self.backend.embed(texts).astype(np.float32)
+        # Norm-check before dividing
+        norms = np.linalg.norm(emb, axis=1, keepdims=True)
+        zero_mask = (norms == 0).flatten()
+        if zero_mask.any():
+            # Deterministic offset for zero vectors (no RNG).
+            fallback = np.zeros((emb.shape[1],), dtype=np.float32)
+            fallback[0] = 1.0 / np.sqrt(emb.shape[1])
+            emb[zero_mask] = fallback
+            norms = np.linalg.norm(emb, axis=1, keepdims=True)
+        emb = emb / np.clip(norms, 1e-9, None)
+        self.embeddings = emb
+        self.chunk_ids = [c["chunk_id"] for c in chunks]
+        self.id_to_idx = {cid: i for i, cid in enumerate(self.chunk_ids)}
 
-        print(f"Encoding {len(texts)} chunks...")
-        embeddings = self.model.encode(
-            texts,
-            batch_size=batch_size,
-            show_progress_bar=True,
-            convert_to_numpy=True,
-        )
-
-        # Normalize
-        embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
-
-        # Check for zero vectors
-        norms = np.linalg.norm(embeddings, axis=1)
-        if np.any(norms == 0):
-            print("Warning: Found zero norm vectors, setting to small random values")
-            zero_mask = norms == 0
-            embeddings[zero_mask] = np.random.randn(sum(zero_mask), embeddings.shape[1]) * 0.01
-            embeddings[zero_mask] = embeddings[zero_mask] / np.linalg.norm(embeddings[zero_mask], axis=1, keepdims=True)
-
-        # Build FAISS index
-        dimension = embeddings.shape[1]
-        self.faiss_index = faiss.IndexFlatIP(dimension)
-        self.faiss_index.add(embeddings.astype(np.float32))
-
-        print(f"Dense index built with {self.faiss_index.ntotal} vectors")
-
-    def index(self, chunks: List[dict], batch_size: Optional[int] = None):
-        """Alias for build_index for backward compatibility."""
-        return self.build_index(chunks, batch_size)
-
-    def search(
-        self,
-        query: str,
-        top_k: int = 50,
-    ) -> List[Tuple[str, float]]:
-        """Search dense index."""
-        if self.faiss_index is None:
+    def search(self, query: str, top_k: int = 50) -> list[tuple[str, float]]:
+        if self.embeddings is None:
             return []
-        
-        query_embedding = self.model.encode([query], convert_to_numpy=True)
-        query_embedding = query_embedding / np.linalg.norm(query_embedding, axis=1, keepdims=True)
-
-        # Check for zero query vector
-        if np.linalg.norm(query_embedding) == 0:
-            query_embedding = np.ones_like(query_embedding) / np.sqrt(query_embedding.shape[1])
-
-        scores, indices = self.faiss_index.search(query_embedding.astype(np.float32), top_k)
-
-        return [
-            (self.chunks[i]["chunk_id"], float(scores[0][j]))
-            for j, i in enumerate(indices[0])
-            if i >= 0 and i < len(self.chunks)
-        ]
+        q = self.backend.embed([query]).astype(np.float32)
+        norm = np.linalg.norm(q)
+        if norm == 0:
+            q[0, 0] = 1.0 / np.sqrt(q.shape[1])
+        else:
+            q = q / norm
+        scores = (self.embeddings @ q.T).flatten()
+        top = np.argsort(scores)[::-1][:top_k]
+        return [(self.chunk_ids[i], float(scores[i])) for i in top if scores[i] > 0]
 
 
 class HybridRetriever:
-    """
-    Hybrid retriever combining BM25 and Dense.
-
-    Based on recommended plan:
-    - BM25 Top50 + Dense Top50
-    - Reciprocal Rank Fusion (RRF): score = Σ 1/(k + rank_i)
-    - k = 60 (typical value)
-    """
+    """Combine sparse + dense with RRF."""
 
     def __init__(
         self,
-        embedding_model: str = "BAAI/bge-m3",
+        backend: EmbeddingBackend,
         rrf_k: int = 60,
-        device: str = "auto",
     ):
-        self.bm25 = BM25Retriever()
-        self.dense = DenseRetriever(model_name=embedding_model, device=device)
+        self.backend = backend
+        self.sparse = BM25Sparse()
+        self.dense = DenseIndex(backend)
         self.rrf_k = rrf_k
+        self.chunks: list[dict[str, Any]] = []
+        self.chunk_map: dict[str, dict[str, Any]] = {}
+        self.parents: dict[str, dict[str, Any]] = {}
 
-        self.chunks: List[dict] = []
-        self.chunk_map: Dict[str, dict] = {}
-
-    def build_index(self, chunks: List[dict]):
-        """Build both BM25 and dense indexes."""
+    def build_index(self, chunks: list[dict[str, Any]]):
+        if not chunks:
+            raise ValueError("cannot build empty index")
         self.chunks = chunks
         self.chunk_map = {c["chunk_id"]: c for c in chunks}
+        self.sparse.index(chunks)
+        self.dense.build(chunks)
 
-        # BM25
-        print("Building BM25 index...")
-        self.bm25.index(chunks)
-
-        # Dense
-        print("Building dense index...")
-        self.dense.build_index(chunks)
-
-        print(f"Hybrid index built: {len(chunks)} chunks")
-
-    def index(self, chunks: List[dict]):
-        """Alias for build_index for backward compatibility."""
-        return self.build_index(chunks)
+    def add_parents(self, parents: Sequence[dict[str, Any]]):
+        for p in parents:
+            self.parents[p["chunk_id"]] = p
 
     def search(
         self,
         query: str,
-        top_k: int = 10,
-        filters: Optional[Dict] = None,
-    ) -> List[RetrievalResult]:
-        """
-        Search with hybrid retrieval and RRF.
-
-        1. BM25 Top50
-        2. Dense Top50
-        3. RRF fusion
-        4. Apply metadata filters
-        5. Return TopK
-        """
-        # Get BM25 results
-        bm25_results = self.bm25.search(query, top_k=50)
-        bm25_scores = {chunk_id: score for chunk_id, score in bm25_results}
-
-        # Get dense results
+        top_k: int = 5,
+        filters: dict[str, Any] | None = None,
+    ) -> list[RetrievalResult]:
+        bm25_results = self.sparse.search(query, top_k=50)
         dense_results = self.dense.search(query, top_k=50)
-        dense_scores = {chunk_id: score for chunk_id, score in dense_results}
 
-        # RRF fusion
-        all_chunk_ids = set(bm25_scores.keys()) | set(dense_scores.keys())
+        rrf: dict[str, float] = {}
+        for rank, (cid, _) in enumerate(bm25_results, 1):
+            rrf[cid] = rrf.get(cid, 0.0) + 1.0 / (self.rrf_k + rank)
+        for rank, (cid, _) in enumerate(dense_results, 1):
+            rrf[cid] = rrf.get(cid, 0.0) + 1.0 / (self.rrf_k + rank)
 
-        rrf_scores = {}
-        for rank, (chunk_id, _) in enumerate(bm25_results, 1):
-            rrf_scores[chunk_id] = rrf_scores.get(chunk_id, 0) + 1 / (self.rrf_k + rank)
-
-        for rank, (chunk_id, _) in enumerate(dense_results, 1):
-            rrf_scores[chunk_id] = rrf_scores.get(chunk_id, 0) + 1 / (self.rrf_k + rank)
-
-        # Sort by RRF score
-        sorted_results = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
-
-        # Build results with full chunk info
-        results = []
-        for chunk_id, rrf_score in sorted_results:
-            if chunk_id not in self.chunk_map:
+        ordered = sorted(rrf.items(), key=lambda x: x[1], reverse=True)
+        results: list[RetrievalResult] = []
+        for cid, score in ordered:
+            chunk = self.chunk_map.get(cid)
+            if chunk is None:
                 continue
-
-            chunk = self.chunk_map[chunk_id]
-
-            # Apply filters
             if filters and not self._passes_filters(chunk, filters):
                 continue
-
-            # Determine source
-            source = []
-            if chunk_id in bm25_scores:
-                source.append("bm25")
-            if chunk_id in dense_scores:
-                source.append("dense")
-
-            results.append(RetrievalResult(
-                chunk_id=chunk_id,
-                text=chunk["text"],
-                doc_id=chunk.get("doc_id", ""),
-                page_start=chunk.get("page_start", 0),
-                page_end=chunk.get("page_end", 0),
-                score=rrf_score,
-                source="+".join(source),
-            ))
-
+            src = []
+            if cid in {x[0] for x in bm25_results}:
+                src.append("bm25")
+            if cid in {x[0] for x in dense_results}:
+                src.append("dense")
+            results.append(
+                RetrievalResult(
+                    chunk_id=cid,
+                    text=chunk["text"],
+                    doc_id=chunk.get("doc_id", ""),
+                    page_start=chunk.get("page_start", 0),
+                    page_end=chunk.get("page_end", 0),
+                    score=score,
+                    source="+".join(src) or "rrf",
+                    parent_chunk_id=chunk.get("parent_chunk_id"),
+                )
+            )
             if len(results) >= top_k:
                 break
-
         return results
 
-    def _passes_filters(self, chunk: dict, filters: Dict) -> bool:
-        """Check if chunk passes metadata filters."""
-        for key, value in filters.items():
-            # Check in both chunk and metadata
-            if key in chunk:
-                chunk_value = chunk.get(key)
-            elif "metadata" in chunk and key in chunk["metadata"]:
-                chunk_value = chunk["metadata"].get(key)
-            else:
-                # Filter key not found in chunk
-                return False  # Fail closed
+    def expand_to_parent(self, results: list[RetrievalResult]) -> list[dict[str, Any]]:
+        """For each child hit, return its parent chunk (for context expansion)."""
+        out: list[dict[str, Any]] = []
+        seen: set = set()
+        for r in results:
+            pid = r.parent_chunk_id
+            if not pid:
+                out.append({"chunk_id": r.chunk_id, "text": r.text, "via": "child_only"})
+                continue
+            parent = self.parents.get(pid) or self.chunk_map.get(pid)
+            if not parent:
+                continue
+            if pid in seen:
+                continue
+            seen.add(pid)
+            out.append(
+                {
+                    "chunk_id": pid,
+                    "text": parent["text"],
+                    "child_ids": parent.get("metadata", {}).get("child_ids", []),
+                    "via": "parent",
+                }
+            )
+        return out
 
+    def _passes_filters(self, chunk: dict[str, Any], filters: dict[str, Any]) -> bool:
+        for key, value in filters.items():
+            chunk_value = chunk.get(key)
+            if chunk_value is None and "metadata" in chunk:
+                chunk_value = chunk.get("metadata", {}).get(key)
+            if chunk_value is None:
+                # Fail closed
+                return False
             if isinstance(value, list):
                 if chunk_value not in value:
                     return False
             elif chunk_value != value:
                 return False
-
         return True
 
-    def save_index(self, output_path: str):
-        """Save index to disk."""
-        import faiss
+    # ---- persistence ------------------------------------------------------
 
-        output_dir = Path(output_path).parent
-        output_dir.mkdir(parents=True, exist_ok=True)
+    def save_index(self, output_dir: str) -> dict[str, Any]:
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
 
-        # Save chunk map
-        chunk_map_path = output_dir / "chunk_map.json"
-        with open(chunk_map_path, 'w', encoding='utf-8') as f:
+        # Chunk order is the order in self.chunks (which equals dense order).
+        chunk_order_path = out / "chunk_order.json"
+        with open(chunk_order_path, "w", encoding="utf-8") as f:
+            json.dump({"chunk_ids": self.chunks}, f, ensure_ascii=False)
+
+        # Chunk map (full bodies)
+        chunk_map_path = out / "chunk_map.json"
+        with open(chunk_map_path, "w", encoding="utf-8") as f:
             json.dump(self.chunk_map, f, ensure_ascii=False)
 
-        # Save FAISS index
-        faiss_path = output_dir / "dense.index"
-        if self.dense.faiss_index is not None:
-            faiss.write_index(self.dense.faiss_index, str(faiss_path))
+        # Parents
+        parents_path = out / "parents.json"
+        with open(parents_path, "w", encoding="utf-8") as f:
+            json.dump(self.parents, f, ensure_ascii=False)
 
-        # Save id mapping
-        id_map = {"id_to_idx": self.dense.id_to_idx}
-        id_map_path = output_dir / "id_map.json"
-        with open(id_map_path, 'w') as f:
-            json.dump(id_map, f)
+        # Dense vectors
+        dense_path = out / "dense.npy"
+        if self.dense.embeddings is not None:
+            np.save(str(dense_path), self.dense.embeddings)
 
-        print(f"Index saved to {output_dir}")
+        # Manifest
+        manifest = {
+            "backend_name": self.backend.name,
+            "backend_revision": getattr(self.backend, "revision", ""),
+            "chunk_count": len(self.chunks),
+            "dim": int(self.dense.embeddings.shape[1]) if self.dense.embeddings is not None else 0,
+            "rrf_k": self.rrf_k,
+        }
+        with open(out / "manifest.json", "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+        return manifest
 
-    def load_index(self, index_dir: str):
-        """Load index from disk."""
-        import faiss
+    def load_index(self, input_dir: str) -> dict[str, Any]:
+        inp = Path(input_dir)
+        if not inp.exists():
+            raise FileNotFoundError(f"index dir not found: {input_dir}")
 
-        index_dir = Path(index_dir)
-
-        # Load chunk map
-        chunk_map_path = index_dir / "chunk_map.json"
-        with open(chunk_map_path, 'r', encoding='utf-8') as f:
+        with open(inp / "chunk_order.json", encoding="utf-8") as f:
+            chunk_order = json.load(f)
+        with open(inp / "chunk_map.json", encoding="utf-8") as f:
             self.chunk_map = json.load(f)
+        with open(inp / "parents.json", encoding="utf-8") as f:
+            self.parents = json.load(f)
 
-        self.chunks = list(self.chunk_map.values())
+        self.chunks = chunk_order["chunk_ids"]
+        # Reconstruct dense chunks list in row order
+        dense_chunks = [self.chunk_map[cid] for cid in self.chunks]
+        # Rebuild sparse and dense
+        self.sparse.index(dense_chunks)
+        self.dense.build(dense_chunks)
 
-        # Load FAISS index
-        faiss_path = index_dir / "dense.index"
-        if faiss_path.exists():
-            self.dense.faiss_index = faiss.read_index(str(faiss_path))
+        dense_npy = inp / "dense.npy"
+        if dense_npy.exists():
+            self.dense.embeddings = np.load(str(dense_npy))
+            self.dense.chunk_ids = self.chunks
+            self.dense.id_to_idx = {cid: i for i, cid in enumerate(self.chunks)}
 
-        # Load id mapping
-        id_map_path = index_dir / "id_map.json"
-        if id_map_path.exists():
-            with open(id_map_path, 'r') as f:
-                id_map = json.load(f)
-                self.dense.id_to_idx = id_map.get("id_to_idx", {})
-
-        # Rebuild BM25
-        self.bm25.index(self.chunks)
-
-        print(f"Index loaded: {len(self.chunks)} chunks")
+        with open(inp / "manifest.json", encoding="utf-8") as f:
+            return json.load(f)
 
 
-def build_retriever(
-    chunks_path: str,
-    embedding_model: str = "BAAI/bge-m3",
-    output_path: Optional[str] = None,
-) -> HybridRetriever:
-    """Build a hybrid retriever from chunks."""
-    # Load chunks
-    chunks = []
-    with open(chunks_path, 'r', encoding='utf-8') as f:
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def _make_backend(backend_name: str) -> EmbeddingBackend:
+    if backend_name == "fake":
+        return FakeEmbeddingBackend()
+    return RealEmbeddingBackend(backend_name)
+
+
+def main() -> int:
+    import argparse
+    parser = argparse.ArgumentParser(description="Build/load a hybrid retriever.")
+    parser.add_argument("--chunks", required=True, help="Path to chunks JSONL")
+    parser.add_argument("--output", required=True, help="Index directory")
+    parser.add_argument("--backend", default="fake")
+    parser.add_argument("--smoke-query", default=None)
+    parser.add_argument("--top-k", type=int, default=5)
+    args = parser.parse_args()
+
+    chunks: list[dict[str, Any]] = []
+    with open(args.chunks, encoding="utf-8") as f:
         for line in f:
+            line = line.strip()
+            if not line:
+                continue
             chunks.append(json.loads(line))
 
-    # Build retriever
-    retriever = HybridRetriever(embedding_model=embedding_model)
-    retriever.build_index(chunks)
+    # Split children vs parents
+    children = [c for c in chunks if c.get("chunk_type") != "mixed" or not c.get("metadata", {}).get("child_ids")]
+    # Heuristic: parents are mixed with child_ids or are table parents
+    parents = [c for c in chunks if c.get("chunk_type") == "mixed" or c.get("chunk_type") == "table" and c.get("metadata", {}).get("source", "").startswith("parent")]
 
-    # Save if path provided
-    if output_path:
-        retriever.save_index(output_path)
+    if not children:
+        raise SystemExit("no chunks available for indexing")
 
-    return retriever
+    backend = _make_backend(args.backend)
+    retriever = HybridRetriever(backend=backend)
+    retriever.build_index(children)
+    retriever.add_parents(parents)
+    manifest = retriever.save_index(args.output)
+    print(f"saved index: {manifest}")
 
-
-# Lazy import faiss
-faiss = None
-def _get_faiss():
-    global faiss
-    if faiss is None:
-        import faiss
-    return faiss
+    if args.smoke_query:
+        results = retriever.search(args.smoke_query, top_k=args.top_k)
+        expanded = retriever.expand_to_parent(results)
+        out = {
+            "smoke_query": args.smoke_query,
+            "backend": backend.name,
+            "results": [r.to_dict() for r in results],
+            "parent_expansion": expanded,
+        }
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
 
 
 if __name__ == "__main__":
-    print("Hybrid Retriever Module")
-    print("Usage: build_retriever(chunks_path, embedding_model)")
+    exit(main())

@@ -5,7 +5,6 @@ Defines the intent taxonomy and slot types for the customer service domain.
 """
 
 from dataclasses import dataclass, field
-from typing import Literal, Optional
 from enum import Enum
 
 
@@ -195,7 +194,7 @@ class IntentClassifier:
 
     def classify(self, query: str) -> tuple[Intent, float]:
         """Classify user query into intent with confidence."""
-        query_lower = query.lower()
+        query.lower()
 
         scores = {}
         for rule in self.rules:

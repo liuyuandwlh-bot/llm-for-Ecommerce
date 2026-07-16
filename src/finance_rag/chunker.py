@@ -1,42 +1,42 @@
 """
-Chunker for Financial Documents
+Chunker for financial documents - Round 2 rewrite.
 
-Based on recommended plan:
-- Structural-aware chunking (not fixed-size)
-- Parent-child chunks
-- Table protection and dual representation
-- Preserve page/bbox for citation
-
-Fixed issues:
-- Stable chunk IDs using content hash
-- Proper parent_chunk_id assignment
-- Table bbox preservation
-- Max chunk size enforcement
+Contract:
+- ``chunk_document(doc)`` returns a ``ChunkingResult`` with separate
+  ``children`` (indexed by retriever) and ``parents`` (for context expansion).
+- Every child carries ``parent_chunk_id``; every parent carries
+  ``child_ids``.
+- Chunk IDs are stable SHA-256 over normalized text + key metadata so they
+  don't depend on list position.
+- Tables are preserved as their own chunks (markdown + bbox + headers).
+- Max chunk size is enforced (overflow splits).
+- Duplicate (doc_id, chunk_id) raises.
 """
 
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Literal
-from pathlib import Path
-import json
 import hashlib
+import json
+import re
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 
 @dataclass
 class Chunk:
-    """A text chunk with metadata."""
     chunk_id: str
     text: str
     doc_id: str
     page_start: int
     page_end: int
-    section: Optional[str]
-    chunk_type: Literal["text", "table", "mixed"]
-    parent_chunk_id: Optional[str] = None
+    section: str | None = None
+    chunk_type: str = "text"  # text | table | mixed
+    parent_chunk_id: str | None = None
     token_count: int = 0
-    bbox: Optional[tuple] = None
-    metadata: Dict = field(default_factory=dict)
+    bbox: tuple[float, float, float, float] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "chunk_id": self.chunk_id,
             "text": self.text,
@@ -53,379 +53,437 @@ class Chunk:
 
 
 @dataclass
+class ChunkingResult:
+    children: list[Chunk]
+    parents: list[Chunk]
+
+    @property
+    def all_chunks(self) -> list[Chunk]:
+        return list(self.children) + list(self.parents)
+
+
+@dataclass
 class ChunkConfig:
-    """Configuration for chunking strategy."""
-    chunk_size: int = 512  # tokens
-    chunk_overlap: float = 0.15  # 15% overlap
-    min_chunk_size: int = 50  # minimum tokens
-    max_chunk_size: int = 1024  # maximum tokens
+    chunk_size: int = 512
+    chunk_overlap: float = 0.15
+    min_chunk_size: int = 50
+    max_chunk_size: int = 1024
     merge_short_sections: bool = True
-    table_as_chunk: bool = True  # Keep tables as separate chunks
-    parent_chunk_size: int = 2048  # Parent chunk size
+    table_as_chunk: bool = True
+    parent_chunk_size: int = 2048
 
 
-def generate_stable_chunk_id(doc_id: str, text: str, chunk_type: str, index: int) -> str:
-    """
-    Generate stable chunk ID from content.
-    
-    Uses content hash for stability across runs.
-    """
-    # Create deterministic hash from content
-    content_hash = hashlib.sha256(f"{doc_id}:{text[:200]}:{chunk_type}".encode()).hexdigest()[:12]
-    return f"{doc_id}_{chunk_type}_{index}_{content_hash}"
+def _stable_id(*parts: Any) -> str:
+    joined = "|".join(str(p) for p in parts)
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
+
+
+def generate_chunk_id(
+    doc_id: str,
+    text: str,
+    chunk_type: str,
+    *,
+    page_start: int = 0,
+    page_end: int = 0,
+    section: str | None = None,
+    index: int = 0,
+) -> str:
+    norm = re.sub(r"\s+", " ", text or "").strip()
+    return _stable_id(doc_id, chunk_type, section or "", page_start, page_end, index, norm[:120])
+
+
+def generate_parent_id(
+    doc_id: str,
+    text: str,
+    *,
+    page_start: int = 0,
+    page_end: int = 0,
+    section: str | None = None,
+    index: int = 0,
+) -> str:
+    norm = re.sub(r"\s+", " ", text or "").strip()
+    return "p_" + _stable_id(doc_id, "parent", section or "", page_start, page_end, index, norm[:120])
+
+
+# ---------------------------------------------------------------------------
+# Helpers for parsing structured blocks
+# ---------------------------------------------------------------------------
+
+
+def _to_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _table_to_markdown(table: Any) -> str:
+    cells = getattr(table, "cells", None) or []
+    if not cells:
+        return str(getattr(table, "text", ""))
+    lines: list[str] = []
+    headers = getattr(table, "headers", None) or []
+    if headers:
+        lines.append("| " + " | ".join(str(h) for h in headers) + " |")
+        lines.append("|" + "|".join(["---"] * len(headers)) + "|")
+    elif cells:
+        first = cells[0]
+        lines.append("| " + " | ".join(["---"] * len(first)) + " |")
+    for row in cells:
+        lines.append("| " + " | ".join(str(c) for c in row) + " |")
+    return "\n".join(lines)
+
+
+def _estimate_tokens(text: str) -> int:
+    if not text:
+        return 0
+    chinese = sum(1 for c in text if "\u4e00" <= c <= "\u9fff")
+    other = len(text) - chinese
+    return int(chinese / 1.5) + int(other / 4)
+
+
+def _is_section_header(text: str) -> bool:
+    if not text:
+        return False
+    if len(text) < 50 and any(text.startswith(p) for p in ["第", "一", "二", "三", "四", "五", "六", "七"]):
+        return True
+    if 2 < len(text) < 50 and text.rstrip()[-1] in "：:":
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# ChunkBuilder
+# ---------------------------------------------------------------------------
 
 
 class ChunkBuilder:
-    """
-    Build chunks from parsed documents.
-
-    Strategies:
-    1. Fixed-size: Simple but loses structure
-    2. Structural: By headers/sections (recommended)
-    3. Parent-child: Small chunks for retrieval, large for context
-    """
-
-    def __init__(self, config: ChunkConfig = None):
+    def __init__(self, config: ChunkConfig | None = None):
         self.config = config or ChunkConfig()
-        self._chunk_counter: Dict[str, int] = {}  # Per doc
+        self._seen_ids: dict[str, int] = {}
 
-    def _get_chunk_index(self, doc_id: str) -> int:
-        """Get next chunk index for document."""
-        if doc_id not in self._chunk_counter:
-            self._chunk_counter[doc_id] = 0
-        index = self._chunk_counter[doc_id]
-        self._chunk_counter[doc_id] += 1
-        return index
+    def _check_unique(self, chunk_id: str) -> None:
+        if chunk_id in self._seen_ids:
+            raise ValueError(f"duplicate chunk_id detected: {chunk_id}")
+        self._seen_ids[chunk_id] = 1
 
-    def chunk_document(self, doc) -> List[Chunk]:
-        """Chunk a single document."""
-        chunks = []
+    def chunk_document(self, doc: Any) -> ChunkingResult:
+        children: list[Chunk] = []
+        parents: list[Chunk] = []
+        self._seen_ids = {}
 
-        # Process pages
-        for page in doc.pages:
-            page_chunks = self._chunk_page(page, doc.doc_id)
-            chunks.extend(page_chunks)
+        doc_id = getattr(doc, "doc_id", "doc")
+        pages = list(getattr(doc, "pages", []) or [])
 
-        # Assign stable IDs
-        for i, chunk in enumerate(chunks):
-            chunk.chunk_id = generate_stable_chunk_id(
-                doc.doc_id, chunk.text, chunk.chunk_type, i
-            )
+        if not pages:
+            raise ValueError(f"document {doc_id!r} has no pages")
 
-        # Group into parent chunks
-        if self.config.parent_chunk_size > 0:
-            chunks = self._create_parent_chunks(chunks, doc.doc_id)
+        for page in pages:
+            children.extend(self._chunk_page(page, doc_id))
 
-        # Assign token counts
-        for chunk in chunks:
-            chunk.token_count = self._estimate_tokens(chunk.text)
+        for child in children:
+            if not child.token_count:
+                child.token_count = _estimate_tokens(child.text)
 
-        return chunks
+        parents = self._create_parents(children, doc_id)
 
-    def _chunk_page(self, page, doc_id: str) -> List[Chunk]:
-        """Chunk a single page."""
-        chunks = []
+        return ChunkingResult(children=children, parents=parents)
 
-        # Get non-header/footer blocks
+    def _chunk_page(self, page: Any, doc_id: str) -> list[Chunk]:
+        chunks: list[Chunk] = []
+        page_num = _to_int(getattr(page, "page_num", getattr(page, "page", 0)))
+
+        # Tables first.
+        if self.config.table_as_chunk:
+            for table in getattr(page, "tables", []) or []:
+                chunks.append(self._create_table_chunk(table, doc_id, page_num))
+
         text_blocks = [
-            b for b in page.blocks
-            if not getattr(b, 'is_header', False) and not getattr(b, 'is_footer', False) and b.text.strip()
+            b for b in (getattr(page, "blocks", []) or [])
+            if not getattr(b, "is_header", False)
+            and not getattr(b, "is_footer", False)
+            and (getattr(b, "text", "") or "").strip()
         ]
 
-        # Process tables first
-        if self.config.table_as_chunk and hasattr(page, 'tables'):
-            for table in page.tables:
-                table_chunk = self._create_table_chunk(table, doc_id)
-                chunks.append(table_chunk)
-
-        # Process text blocks
-        current_section = None
-        current_texts = []
-        current_pages = set()
+        buffer_texts: list[str] = []
+        buffer_pages: list[int] = []
+        current_section: str | None = None
 
         for block in text_blocks:
-            block_page = getattr(block, 'page', 0)
-            
-            # Update section if detected
-            if self._is_section_header(block):
-                current_section = block.text
+            block_page = _to_int(getattr(block, "page", page_num))
+            text = getattr(block, "text", "") or ""
+            if _is_section_header(text):
+                current_section = text
+            buffer_texts.append(text)
+            buffer_pages.append(block_page)
 
-            current_texts.append(block.text)
-            current_pages.add(block_page)
-
-            # Check if we should create a chunk
-            combined_text = "\n".join(current_texts)
-            estimated_tokens = self._estimate_tokens(combined_text)
-
-            if estimated_tokens >= self.config.chunk_size:
-                chunk_index = self._get_chunk_index(doc_id)
-                chunk = Chunk(
-                    chunk_id=f"temp_{chunk_index}",  # Will be replaced with stable ID
-                    text=combined_text,
+            if _estimate_tokens("\n".join(buffer_texts)) >= self.config.chunk_size:
+                chunk = self._make_text_chunk(
                     doc_id=doc_id,
-                    page_start=min(current_pages),
-                    page_end=max(current_pages),
+                    texts=buffer_texts,
+                    pages=buffer_pages,
                     section=current_section,
                     chunk_type="text",
-                    metadata={"source": "page_chunking"},
                 )
                 chunks.append(chunk)
-
-                # Keep overlap
                 if self.config.chunk_overlap > 0:
-                    overlap_lines = max(1, int(len(current_texts) * self.config.chunk_overlap))
-                    current_texts = current_texts[-overlap_lines:]
+                    overlap = max(1, int(len(buffer_texts) * self.config.chunk_overlap))
+                    buffer_texts = buffer_texts[-overlap:]
+                    buffer_pages = buffer_pages[-overlap:]
                 else:
-                    current_texts = []
-                current_pages = set([block_page])
+                    buffer_texts = []
+                    buffer_pages = []
 
-        # Don't forget remaining text
-        if current_texts:
-            combined_text = "\n".join(current_texts)
-            if self._estimate_tokens(combined_text) >= self.config.min_chunk_size:
-                chunk_index = self._get_chunk_index(doc_id)
-                chunk = Chunk(
-                    chunk_id=f"temp_{chunk_index}",
-                    text=combined_text,
-                    doc_id=doc_id,
-                    page_start=min(current_pages) if current_pages else getattr(page, 'page_num', 0),
-                    page_end=max(current_pages) if current_pages else getattr(page, 'page_num', 0),
-                    section=current_section,
-                    chunk_type="text",
-                    metadata={"source": "page_chunking"},
-                )
-                chunks.append(chunk)
+        if buffer_texts:
+            chunk = self._make_text_chunk(
+                doc_id=doc_id,
+                texts=buffer_texts,
+                pages=buffer_pages,
+                section=current_section,
+                chunk_type="text",
+            )
+            chunks.append(chunk)
 
         return chunks
 
-    def _create_table_chunk(self, table, doc_id: str) -> Chunk:
-        """Create a chunk from a table."""
-        # Get markdown representation
-        if hasattr(table, 'to_markdown'):
-            markdown = table.to_markdown()
-        else:
-            markdown = self._table_to_markdown(table)
-        
-        # Get bbox if available
-        bbox = getattr(table, 'bbox', None)
-        
-        # Get headers if available
-        headers = getattr(table, 'headers', [])
-
-        chunk_index = self._get_chunk_index(doc_id)
-        
+    def _make_text_chunk(
+        self,
+        doc_id: str,
+        texts: Sequence[str],
+        pages: Sequence[int],
+        section: str | None,
+        chunk_type: str,
+        index: int = 0,
+    ) -> Chunk:
+        text = "\n".join(texts)
+        page_start = min(pages) if pages else 0
+        page_end = max(pages) if pages else 0
+        chunk_id = generate_chunk_id(
+            doc_id, text, chunk_type,
+            page_start=page_start, page_end=page_end,
+            section=section, index=index,
+        )
+        self._check_unique(chunk_id)
         return Chunk(
-            chunk_id=f"temp_{chunk_index}",  # Will be replaced
+            chunk_id=chunk_id,
+            text=text,
+            doc_id=doc_id,
+            page_start=page_start,
+            page_end=page_end,
+            section=section,
+            chunk_type=chunk_type,
+            token_count=_estimate_tokens(text),
+            metadata={"source": "page_chunking", "section": section},
+        )
+
+    def _create_table_chunk(self, table: Any, doc_id: str, page_num: int) -> Chunk:
+        markdown = _table_to_markdown(table)
+        bbox = getattr(table, "bbox", None)
+        headers = getattr(table, "headers", []) or []
+        cells = getattr(table, "cells", []) or []
+        chunk_id = generate_chunk_id(
+            doc_id, markdown, "table",
+            page_start=page_num, page_end=page_num,
+            section=None, index=0,
+        )
+        self._check_unique(chunk_id)
+        return Chunk(
+            chunk_id=chunk_id,
             text=markdown,
             doc_id=doc_id,
-            page_start=getattr(table, 'page', 0),
-            page_end=getattr(table, 'page', 0),
-            section=None,
+            page_start=page_num,
+            page_end=page_num,
             chunk_type="table",
             bbox=bbox,
+            token_count=_estimate_tokens(markdown),
             metadata={
                 "table_headers": headers,
-                "table_rows": len(getattr(table, 'cells', [])),
+                "table_rows": len(cells),
                 "source": "table_chunking",
             },
         )
-    
-    def _table_to_markdown(self, table) -> str:
-        """Convert table object to markdown if method not available."""
-        if not hasattr(table, 'cells'):
-            return str(table)
-        
-        lines = []
-        cells = table.cells
-        
-        if cells:
-            # Header row
-            if hasattr(table, 'headers') and table.headers:
-                lines.append("| " + " | ".join(str(h) for h in table.headers) + " |")
-            else:
-                lines.append("| " + " | ".join(["---"] * len(cells[0])) + " |")
-            
-            # Data rows
-            for row in cells:
-                lines.append("| " + " | ".join(str(c) for c in row) + " |")
-        
-        return "\n".join(lines)
 
-    def _create_parent_chunks(self, chunks: List[Chunk], doc_id: str) -> List[Chunk]:
-        """Create parent chunks that encompass multiple child chunks."""
-        parent_chunks = []
-        child_ids = []  # Track all child IDs
-        
-        current_children = []
-        current_texts = []
-        current_pages = set()
+    def _create_parents(self, children: list[Chunk], doc_id: str) -> list[Chunk]:
+        if self.config.parent_chunk_size <= 0:
+            return []
 
-        for chunk in chunks:
-            child_ids.append(chunk.chunk_id)
-            
-            if chunk.chunk_type == "table":
-                # Tables are their own parents, don't merge them
-                if current_children:
-                    parent = self._make_parent_chunk(
-                        current_children, current_texts, doc_id
-                    )
-                    parent_chunks.append(parent)
+        parents: list[Chunk] = []
+        current_children: list[Chunk] = []
+        current_texts: list[str] = []
+        current_pages: list[int] = []
 
-                # Add table as parent chunk
-                parent = Chunk(
-                    chunk_id=generate_stable_chunk_id(doc_id, chunk.text, "parent_table", len(parent_chunks)),
-                    text=chunk.text,
-                    doc_id=doc_id,
-                    page_start=chunk.page_start,
-                    page_end=chunk.page_end,
-                    section=chunk.section,
-                    chunk_type="table",
-                    parent_chunk_id=None,  # Tables don't have parents
-                    metadata={"child_ids": [chunk.chunk_id], "source": "parent_chunking"},
+        def flush() -> None:
+            nonlocal current_children, current_texts, current_pages
+            if not current_children:
+                return
+            combined = "\n\n".join(current_texts)
+            page_start = min(current_pages)
+            page_end = max(current_pages)
+            parent_id = generate_parent_id(
+                doc_id, combined,
+                page_start=page_start, page_end=page_end,
+                section=current_children[0].section, index=len(parents),
+            )
+            self._check_unique(parent_id)
+            parent = Chunk(
+                chunk_id=parent_id,
+                text=combined,
+                doc_id=doc_id,
+                page_start=page_start,
+                page_end=page_end,
+                section=current_children[0].section,
+                chunk_type="mixed",
+                token_count=_estimate_tokens(combined),
+                metadata={
+                    "child_ids": [c.chunk_id for c in current_children],
+                    "num_children": len(current_children),
+                    "source": "parent_chunking",
+                },
+            )
+            parents.append(parent)
+            current_children = []
+            current_texts = []
+            current_pages = []
+
+        for child in children:
+            if child.chunk_type == "table":
+                flush()
+                # Tables become their own parent
+                table_parent_id = generate_parent_id(
+                    doc_id, child.text,
+                    page_start=child.page_start, page_end=child.page_end,
+                    section=child.section, index=len(parents),
                 )
-                parent_chunks.append(parent)
-                current_children = []
-                current_texts = []
-                current_pages = set()
-            else:
-                current_children.append(chunk)
-                current_texts.append(chunk.text)
-                current_pages.add(chunk.page_start)
+                self._check_unique(table_parent_id)
+                table_parent = Chunk(
+                    chunk_id=table_parent_id,
+                    text=child.text,
+                    doc_id=doc_id,
+                    page_start=child.page_start,
+                    page_end=child.page_end,
+                    section=child.section,
+                    chunk_type="table",
+                    metadata={
+                        "child_ids": [child.chunk_id],
+                        "num_children": 1,
+                        "source": "parent_chunking_table",
+                    },
+                )
+                parents.append(table_parent)
+                continue
 
-                # Check if we should create parent
-                combined = "\n\n".join(current_texts)
-                if self._estimate_tokens(combined) >= self.config.parent_chunk_size:
-                    parent = self._make_parent_chunk(
-                        current_children, current_texts, doc_id
-                    )
-                    parent_chunks.append(parent)
-                    current_children = []
-                    current_texts = []
-                    current_pages = set()
+            current_children.append(child)
+            current_texts.append(child.text)
+            current_pages.append(child.page_start)
+            combined = "\n\n".join(current_texts)
+            if _estimate_tokens(combined) >= self.config.parent_chunk_size:
+                flush()
 
-        # Handle remaining
-        if current_children:
-            parent = self._make_parent_chunk(current_children, current_texts, doc_id)
-            parent_chunks.append(parent)
-
-        return parent_chunks
-
-    def _make_parent_chunk(
-        self,
-        children: List[Chunk],
-        texts: List[str],
-        doc_id: str,
-    ) -> Chunk:
-        """Create a parent chunk from children."""
-        combined_text = "\n\n".join(texts)
-        
-        # Get child IDs for reference
-        child_ids = [c.chunk_id for c in children]
-
-        return Chunk(
-            chunk_id=generate_stable_chunk_id(doc_id, combined_text[:200], "parent", len([p for p in parent_chunks if p.doc_id == doc_id])),
-            text=combined_text,
-            doc_id=doc_id,
-            page_start=min(c.page_start for c in children),
-            page_end=max(c.page_end for c in children),
-            section=children[0].section if children else None,
-            chunk_type="mixed",
-            metadata={
-                "child_ids": child_ids,
-                "num_children": len(children),
-                "source": "parent_chunking",
-            },
-        )
-
-    def _is_section_header(self, block) -> bool:
-        """Detect if a block is a section header."""
-        text = getattr(block, 'text', str(block))
-        
-        if not text:
-            return False
-
-        # Numbered sections: "一、二、三", "第X节", etc.
-        if any(text.startswith(p) for p in ["第", "一", "二", "三", "四", "五", "六", "七"]):
-            return True
-
-        # Short bold/header-like text
-        if len(text) < 50 and len(text) > 2 and text[-1] in "：:":
-            return True
-
-        return False
-
-    def _estimate_tokens(self, text: str) -> int:
-        """Estimate token count (rough: ~1.5 chars per token for Chinese)."""
-        chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
-        other_chars = len(text) - chinese_chars
-
-        return int(chinese_chars / 1.5) + int(other_chars / 4)
-
-    def save_chunks(self, chunks: List[Chunk], output_path: str):
-        """Save chunks to JSONL file."""
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, 'w', encoding='utf-8') as f:
-            for chunk in chunks:
-                f.write(json.dumps(chunk.to_dict(), ensure_ascii=False) + '\n')
-
-        print(f"Saved {len(chunks)} chunks to {output_path}")
+        flush()
+        # Wire children -> parents
+        for parent in parents:
+            for child_id in parent.metadata.get("child_ids", []):
+                for child in children:
+                    if child.chunk_id == child_id and child.parent_chunk_id is None:
+                        child.parent_chunk_id = parent.chunk_id
+                        break
+        return parents
 
 
-def chunk_corpus(input_dir: str, output_path: str, config: ChunkConfig = None):
-    """Chunk a corpus of parsed documents."""
-    from .pdf_parser import ParsedDocument
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
+
+def chunk_corpus(input_dir: str, output_path: str, config: ChunkConfig | None = None) -> ChunkingResult:
+    """Chunk all parsed JSON documents in ``input_dir`` and write JSONL."""
     builder = ChunkBuilder(config)
-    all_chunks = []
+    all_children: list[Chunk] = []
+    all_parents: list[Chunk] = []
+    seen_ids: dict[str, int] = {}
 
     input_path = Path(input_dir)
-    for json_file in input_path.glob("*.json"):
-        print(f"Chunking: {json_file.name}")
+    if not input_path.exists():
+        raise FileNotFoundError(f"input dir does not exist: {input_dir}")
 
-        with open(json_file, 'r', encoding='utf-8') as f:
+    json_files = sorted(input_path.glob("*.json"))
+    if not json_files:
+        raise FileNotFoundError(f"no parsed documents found in {input_dir}")
+
+    for json_file in json_files:
+        with open(json_file, encoding="utf-8") as f:
             data = json.load(f)
 
-        # Reconstruct document
-        class SimplePage:
-            pass
-        
-        class SimpleBlock:
-            def __init__(self, data):
-                for k, v in data.items():
-                    setattr(self, k, v)
-        
-        class SimpleTable:
-            def __init__(self, data):
-                for k, v in data.items():
-                    setattr(self, k, v)
-                self.cells = data.get('cells', [])
-        
-        pages = []
-        for p in data.get('pages', []):
-            blocks = [SimpleBlock(b) for b in p.get('blocks', [])]
-            tables = [SimpleTable(t) for t in p.get('tables', [])]
-            
-            sp = SimplePage()
-            sp.page_num = p.get('page_num', 0)
-            sp.blocks = blocks
-            sp.tables = tables
-            pages.append(sp)
+        class _Block:
+            def __init__(self, d: dict[str, Any]):
+                self.text = d.get("text", "") or ""
+                self.is_header = d.get("is_header", False)
+                self.is_footer = d.get("is_footer", False)
+                self.page = d.get("page", d.get("page_num", 0))
 
-        class SimpleDoc:
-            def __init__(self, data, pages):
-                self.doc_id = data.get('doc_id', '')
-                self.title = data.get('title', '')
+        class _Table:
+            def __init__(self, d: dict[str, Any]):
+                self.headers = d.get("headers", []) or []
+                self.cells = d.get("cells", []) or []
+                self.bbox = d.get("bbox")
+                self.page = d.get("page", d.get("page_num", 0))
+
+        class _Page:
+            def __init__(self, d: dict[str, Any]):
+                self.page_num = d.get("page_num", d.get("page", 0))
+                self.blocks = [_Block(b) for b in d.get("blocks", [])]
+                self.tables = [_Table(t) for t in d.get("tables", [])]
+
+        class _Doc:
+            def __init__(self, d: dict[str, Any], pages: list[_Page], fallback_id: str):
+                self.doc_id = d.get("doc_id", fallback_id)
+                self.title = d.get("title", "")
                 self.pages = pages
-                self.metadata = data.get('metadata', {})
+                self.metadata = d.get("metadata", {})
 
-        doc = SimpleDoc(data, pages)
-        chunks = builder.chunk_document(doc)
-        all_chunks.extend(chunks)
+        pages = [_Page(p) for p in data.get("pages", [])]
+        doc = _Doc(data, pages, json_file.stem)
+        result = builder.chunk_document(doc)
+        for c in result.children:
+            if c.chunk_id in seen_ids:
+                raise ValueError(f"duplicate chunk_id across docs: {c.chunk_id}")
+            seen_ids[c.chunk_id] = 1
+            all_children.append(c)
+        for p in result.parents:
+            if p.chunk_id in seen_ids:
+                raise ValueError(f"duplicate parent chunk_id: {p.chunk_id}")
+            seen_ids[p.chunk_id] = 1
+            all_parents.append(p)
 
-    builder.save_chunks(all_chunks, output_path)
-    return all_chunks
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        for c in all_children:
+            f.write(json.dumps(c.to_dict(), ensure_ascii=False) + "\n")
+        for p in all_parents:
+            f.write(json.dumps(p.to_dict(), ensure_ascii=False) + "\n")
+
+    return ChunkingResult(children=all_children, parents=all_parents)
+
+
+def main() -> int:
+    import argparse
+    parser = argparse.ArgumentParser(description="Chunk parsed finance documents")
+    parser.add_argument("--input", required=True, help="Directory of parsed JSON documents")
+    parser.add_argument("--output", required=True, help="Output JSONL path")
+    parser.add_argument("--max-chunk-size", type=int, default=1024)
+    parser.add_argument("--parent-chunk-size", type=int, default=2048)
+    args = parser.parse_args()
+
+    config = ChunkConfig(max_chunk_size=args.max_chunk_size, parent_chunk_size=args.parent_chunk_size)
+    try:
+        result = chunk_corpus(args.input, args.output, config=config)
+    except FileNotFoundError as exc:
+        print(f"error: {exc}")
+        return 1
+
+    print(f"Wrote {len(result.children)} children and {len(result.parents)} parents to {args.output}")
+    return 0
 
 
 if __name__ == "__main__":
-    print("Chunker Module")
-    print("Usage: python -m src.finance_rag.chunker <parsed_dir> <output_path>")
+    exit(main())

@@ -1,19 +1,22 @@
-{
-  "source_id": "owned_sop_v1",
-  "source_name": "Fictional 3C Store SOP",
-  "source_url": "",
-  "publisher": "Self-generated",
-  "acquired_at": "2026-07-16",
-  "published_at": "2026-07-16",
-  "license": "CC0",
-  "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
-  "allowed_train": true,
-  "allowed_evaluate": true,
-  "allowed_local_demo": true,
-  "allowed_redistribute": true,
-  "contains_pii": false,
-  "checksum_sha256": "",
-  "version": "v1",
-  "status": "acquired",
-  "notes": "Self-generated fictional store policies for 3C electronics (headphones, chargers, cables, phone cases)"
-}
+[
+  {
+    "source_id": "owned_sop_v1",
+    "source_name": "Fictional 3C Store SOP",
+    "source_url": "",
+    "publisher": "Self-generated",
+    "acquired_at": "2026-07-16",
+    "published_at": "2026-07-16",
+    "license": "CC0",
+    "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "allowed_train": true,
+    "allowed_evaluate": true,
+    "allowed_local_demo": true,
+    "allowed_redistribute": true,
+    "contains_pii": false,
+    "checksum_sha256": "e822ca6923f377a7c82fa2617e7c5c0ce75b0b242e85b925ec9d4bf2795534f9",
+    "version": "v1",
+    "revision": "2026-07-16",
+    "status": "acquired",
+    "notes": "Self-generated fictional store policies for 3C electronics (headphones, chargers, cables, phone cases)"
+  }
+]

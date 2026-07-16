@@ -4,8 +4,9 @@ API Schemas
 Pydantic models for API request/response validation.
 """
 
+from typing import Any, Literal
+
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Literal, Any
 
 
 # Customer Service Schemas
@@ -13,18 +14,18 @@ class CustomerServiceRequest(BaseModel):
     """Customer service request schema."""
     query: str = Field(..., description="User query")
     domain: Literal["ecommerce", "finance"] = Field(default="ecommerce")
-    history: Optional[List[Dict[str, str]]] = Field(default=None, description="Conversation history")
-    user_id: Optional[str] = Field(default=None, description="User identifier (for tracking)")
-    session_id: Optional[str] = Field(default=None, description="Session identifier")
+    history: list[dict[str, str]] | None = Field(default=None, description="Conversation history")
+    user_id: str | None = Field(default=None, description="User identifier (for tracking)")
+    session_id: str | None = Field(default=None, description="Session identifier")
 
 
 class CustomerServiceResponse(BaseModel):
     """Customer service response schema."""
     response: str = Field(..., description="Model response")
-    intent: Optional[str] = Field(default=None, description="Detected intent")
-    slots: Optional[Dict[str, Any]] = Field(default=None, description="Extracted slots")
+    intent: str | None = Field(default=None, description="Detected intent")
+    slots: dict[str, Any] | None = Field(default=None, description="Extracted slots")
     requires_human: bool = Field(default=False, description="Whether to escalate")
-    confidence: Optional[float] = Field(default=None, ge=0, le=1)
+    confidence: float | None = Field(default=None, ge=0, le=1)
     latency_ms: float = Field(..., description="Response latency in milliseconds")
 
 
@@ -33,7 +34,7 @@ class FinanceRAGRequest(BaseModel):
     """Finance RAG request schema."""
     query: str = Field(..., description="User query")
     domain: Literal["finance"] = Field(default="finance")
-    filters: Optional[Dict[str, Any]] = Field(
+    filters: dict[str, Any] | None = Field(
         default=None,
         description="Metadata filters (company, year, etc.)"
     )
@@ -46,16 +47,16 @@ class Citation(BaseModel):
     doc_id: str
     page: int
     evidence: str
-    score: Optional[float] = None
+    score: float | None = None
 
 
 class FinanceRAGResponse(BaseModel):
     """Finance RAG response schema."""
     answer: str = Field(..., description="Generated answer")
-    citations: List[Citation] = Field(default_factory=list, description="Source citations")
+    citations: list[Citation] = Field(default_factory=list, description="Source citations")
     confidence: Literal["high", "medium", "low"] = Field(default="medium")
-    limitations: List[str] = Field(default_factory=list, description="Known limitations")
-    calculations: Optional[List[Dict[str, Any]]] = Field(default=None, description="Calculations performed")
+    limitations: list[str] = Field(default_factory=list, description="Known limitations")
+    calculations: list[dict[str, Any]] | None = Field(default=None, description="Calculations performed")
     latency_ms: float = Field(..., description="Response latency in milliseconds")
 
 
@@ -65,7 +66,9 @@ class HealthResponse(BaseModel):
     status: Literal["healthy", "degraded", "unhealthy"]
     version: str
     uptime_seconds: float
-    models_loaded: List[str] = Field(default_factory=list)
+    mode: Literal["mock", "real"] = "mock"
+    models_loaded: list[str] = Field(default_factory=list)
+    backend_ready: bool = False
     cache_hits: int = 0
     cache_misses: int = 0
 
@@ -75,17 +78,17 @@ class ErrorResponse(BaseModel):
     """Error response schema."""
     error: str = Field(..., description="Error type")
     message: str = Field(..., description="Error message")
-    details: Optional[Dict[str, Any]] = Field(default=None)
-    request_id: Optional[str] = Field(default=None)
+    details: dict[str, Any] | None = Field(default=None)
+    request_id: str | None = Field(default=None)
 
 
 # Batch Request Schemas
 class BatchCustomerServiceRequest(BaseModel):
     """Batch customer service request."""
-    requests: List[CustomerServiceRequest] = Field(..., max_length=100)
+    requests: list[CustomerServiceRequest] = Field(..., max_length=100)
 
 
 class BatchCustomerServiceResponse(BaseModel):
     """Batch customer service response."""
-    responses: List[CustomerServiceResponse]
+    responses: list[CustomerServiceResponse]
     total_latency_ms: float

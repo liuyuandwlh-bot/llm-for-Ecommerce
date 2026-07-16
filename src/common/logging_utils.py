@@ -6,13 +6,12 @@ Structured logging with structlog.
 
 import logging
 import sys
-from typing import Optional
 
 
 def setup_logging(
     level: str = "INFO",
     format: str = "json",
-    log_file: Optional[str] = None,
+    log_file: str | None = None,
 ):
     """
     Setup structured logging.

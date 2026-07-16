@@ -1,59 +1,66 @@
 """
 E-commerce dataset module.
 
-Submodules:
-- sop_builder: Policy/SOP builder for fictional 3C store
-- policy_engine: Deterministic policy matching engine
-- canonical_cases: Test case generator
-- conversation_generator: Synthetic conversation generator
-- pipeline: Data processing pipeline
+Round 2 layout.
 
-Usage:
-    # Build policies
-    from src.ecommerce.dataset import SOPBuilder
-    builder = SOPBuilder()
-    policies = builder.build_fictional_store_sops()
-    
-    # Generate cases
-    from src.ecommerce.dataset import CanonicalCaseGenerator
-    generator = CanonicalCaseGenerator()
-    cases = generator.generate_all()
-    
-    # Generate conversations
-    from src.ecommerce.dataset import ConversationGenerator
-    conv_gen = ConversationGenerator(policies=policies)
-    conversations = conv_gen.generate_from_cases(cases)
-    
-    # Run pipeline
-    from src.ecommerce.dataset import run_pipeline
-    splits = run_pipeline()
+Public surface is intentionally narrow: the heavy logic lives in the
+submodules; this ``__init__`` only re-exports a small set of convenience
+classes/functions used by scripts and tests.
 """
 
-# Import for convenience
+from .canonical_cases import (
+    INTENTS,
+    CanonicalCase,
+    CanonicalCaseGenerator,
+    CaseType,
+    validate_canonical_cases,
+)
+from .conversation_generator import (
+    ConversationGenerator,
+    DeterministicConversationGenerator,
+    LLMUnavailableError,
+    SyntheticConversation,
+)
+from .pipeline import (
+    STAGES,
+    # Backward-compat aliases for tests
+    DataPipeline,
+    PipelineConfig,
+    StageStats,
+    check_leakage,
+    run_pipeline,
+    stratified_group_split,
+)
+from .policy_engine import BehaviorIntent, Decision, PolicyEngine, PolicyMatch, SlotSchema
 from .sop_builder import SOPBuilder, build_sops
-from .policy_engine import PolicyEngine, PolicyMatch, Decision, SlotSchema
-from .canonical_cases import CanonicalCase, CanonicalCaseGenerator, CaseType, INTENTS as INTENT_LIST  # noqa: F401
-from .conversation_generator import ConversationGenerator, SyntheticConversation
-from .pipeline import DataPipeline, run_pipeline
+
+# Re-export INTENTS as INTENT_LIST for the original API
+INTENT_LIST = INTENTS
+
 
 __all__ = [
-    # SOP Builder
     "SOPBuilder",
     "build_sops",
-    # Policy Engine
     "PolicyEngine",
     "PolicyMatch",
     "Decision",
     "SlotSchema",
-    # Canonical Cases
+    "BehaviorIntent",
     "CanonicalCase",
     "CanonicalCaseGenerator",
     "CaseType",
+    "INTENTS",
     "INTENT_LIST",
-    # Conversation Generator
+    "validate_canonical_cases",
     "ConversationGenerator",
+    "DeterministicConversationGenerator",
     "SyntheticConversation",
-    # Pipeline
-    "DataPipeline",
+    "LLMUnavailableError",
+    "PipelineConfig",
     "run_pipeline",
+    "stratified_group_split",
+    "check_leakage",
+    "StageStats",
+    "STAGES",
+    "DataPipeline",
 ]

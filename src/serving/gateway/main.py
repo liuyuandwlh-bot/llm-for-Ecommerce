@@ -4,11 +4,12 @@ FastAPI Gateway Main Application
 Domain-routing API gateway.
 """
 
+import os
 import time
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import Literal
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -17,33 +18,32 @@ from src.common.schemas import HealthResponse
 
 logger = get_logger(__name__)
 
-# Global state
 start_time = time.time()
 
 
 def create_app() -> FastAPI:
     """Create FastAPI application."""
-    
-    models_loaded: List[str] = []
-    
+
+    models_loaded: list[str] = []
+    backend_mode: Literal["mock", "real"] = (
+        "real" if os.environ.get("LLM_PORTFOLIO_REAL_BACKEND") == "1" else "mock"
+    )
+    backend_ready = False
+    cache_hits = 0
+    cache_misses = 0
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         """Application lifespan events."""
-        nonlocal models_loaded
-        
-        # Startup
-        logger.info("Starting LLM Portfolio Platform API")
-        logger.info("Loading models...")
-        
-        # Model loading is deferred to actual endpoints
-        # to support both mock and real backends
-        models_loaded.append("placeholder")
-        
-        logger.info("Models loaded: %s", models_loaded)
-        
+        nonlocal models_loaded, backend_ready
+        logger.info("Starting LLM Portfolio Platform API (mode=%s)", backend_mode)
+
+        if backend_mode == "real":
+            # Real backend wiring belongs in src.serving.gateway.bootstrap.
+            # Loading a real model is out of scope for this round.
+            backend_ready = False
+            logger.info("Real backend requested but no model is loaded; using mock.")
         yield
-        
-        # Shutdown
         logger.info("Shutting down...")
 
     app = FastAPI(
@@ -53,13 +53,19 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # CORS - configure properly for production
+    # CORS - configurable via environment (defaults to a safe local-only set).
+    allowed_origins_env = os.environ.get("LLM_PORTFOLIO_ALLOWED_ORIGINS")
+    if allowed_origins_env:
+        allowed_origins = [o.strip() for o in allowed_origins_env.split(",") if o.strip()]
+    else:
+        allowed_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],  # TODO: Configure for production
-        allow_credentials=True,  # TODO: Set specific origins in production
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=allowed_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type", "Authorization"],
     )
 
     # Include routers
@@ -69,11 +75,18 @@ def create_app() -> FastAPI:
     @app.get("/health", response_model=HealthResponse)
     async def health_check():
         """Health check endpoint."""
+        status: Literal["healthy", "degraded", "unhealthy"] = (
+            "degraded" if backend_mode == "real" and not backend_ready else "healthy"
+        )
         return HealthResponse(
-            status="healthy",
+            status=status,
             version="0.2.0",
             uptime_seconds=time.time() - start_time,
+            mode=backend_mode,
             models_loaded=models_loaded,
+            backend_ready=backend_ready,
+            cache_hits=cache_hits,
+            cache_misses=cache_misses,
         )
 
     @app.exception_handler(HTTPException)
@@ -100,7 +113,7 @@ def create_app() -> FastAPI:
                 "message": "An unexpected error occurred",
             },
         )
-    
+
     return app
 
 

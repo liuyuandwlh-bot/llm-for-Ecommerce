@@ -8,11 +8,10 @@ Based on recommended plan:
 - Confidence and limitations reporting
 """
 
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Any
 import json
 import re
-from decimal import Decimal, InvalidOperation
+from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -29,26 +28,26 @@ class Claim:
 class Calculation:
     """A calculation performed."""
     formula: str
-    operands: List[Any]
+    operands: list[Any]
     result: Any
-    unit: Optional[str] = None
+    unit: str | None = None
 
 
 @dataclass
 class Answer:
     """A complete answer with citations."""
     answer: str
-    claims: List[Claim]
-    calculations: List[Calculation] = field(default_factory=list)
+    claims: list[Claim]
+    calculations: list[Calculation] = field(default_factory=list)
     confidence: str = "high"  # high, medium, low
-    limitations: List[str] = field(default_factory=list)
-    metadata: Dict = field(default_factory=dict)
+    limitations: list[str] = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)
 
 
 class Calculator:
     """Financial calculator for numerical reasoning."""
 
-    def extract_numbers(self, text: str) -> List[float]:
+    def extract_numbers(self, text: str) -> list[float]:
         """Extract numbers from text."""
         # Match numbers with optional units
         pattern = r'([\d,]+\.?\d*)\s*(亿|万|千|%)?'
@@ -75,31 +74,21 @@ class Calculator:
 
         return numbers
 
-    def parse_formula(self, formula: str) -> Optional[str]:
+    def parse_formula(self, formula: str) -> str | None:
         """Parse a formula like 'revenue * margin'."""
         # Simple formula parsing
         formula = formula.lower().strip()
 
         # Define common financial terms
-        term_map = {
-            'revenue': 'revenue',
-            '收入': 'revenue',
-            '利润': 'profit',
-            'margin': 'margin',
-            '毛利率': 'gross_margin',
-            '成本': 'cost',
-            'assets': 'assets',
-            ' liabilities': 'liabilities',
-        }
 
         return formula
 
     def calculate(
         self,
         formula: str,
-        context: Dict[str, Any],
+        context: dict[str, Any],
         tolerance: float = 0.01,
-    ) -> Optional[Calculation]:
+    ) -> Calculation | None:
         """Perform a calculation."""
         # Simple calculation support
         # In practice, would use a proper parser or calculator tool
@@ -143,8 +132,8 @@ class AnswerEngine:
     def generate(
         self,
         query: str,
-        retrieved_chunks: List[dict],
-        system_prompt: Optional[str] = None,
+        retrieved_chunks: list[dict],
+        system_prompt: str | None = None,
     ) -> Answer:
         """
         Generate an answer with citations.
@@ -190,7 +179,7 @@ class AnswerEngine:
             },
         )
 
-    def _build_context(self, chunks: List[dict]) -> str:
+    def _build_context(self, chunks: list[dict]) -> str:
         """Build context string from chunks."""
         context_parts = []
 
@@ -206,7 +195,7 @@ class AnswerEngine:
         self,
         query: str,
         context: str,
-        system_prompt: Optional[str] = None,
+        system_prompt: str | None = None,
     ) -> str:
         """Build generation prompt."""
         if system_prompt is None:
@@ -247,9 +236,9 @@ class AnswerEngine:
     def _extract_claims(
         self,
         query: str,
-        chunks: List[dict],
+        chunks: list[dict],
         answer: str,
-    ) -> List[Claim]:
+    ) -> list[Claim]:
         """Extract claims and verify against sources."""
         claims = []
 
@@ -274,8 +263,8 @@ class AnswerEngine:
     def _check_calculations(
         self,
         query: str,
-        chunks: List[dict],
-    ) -> List[Calculation]:
+        chunks: list[dict],
+    ) -> list[Calculation]:
         """Check if query requires calculations."""
         calc_keywords = ['增长', '下降', '占比', '同比', '环比', '平均', '总计', '增加', '减少']
 
@@ -297,8 +286,8 @@ class AnswerEngine:
     def _assess_confidence(
         self,
         query: str,
-        chunks: List[dict],
-        claims: List[Claim],
+        chunks: list[dict],
+        claims: list[Claim],
     ) -> str:
         """Assess answer confidence."""
         if not chunks:
@@ -315,9 +304,9 @@ class AnswerEngine:
     def _identify_limitations(
         self,
         query: str,
-        chunks: List[dict],
-        claims: List[Claim],
-    ) -> List[str]:
+        chunks: list[dict],
+        claims: list[Claim],
+    ) -> list[str]:
         """Identify answer limitations."""
         limitations = []
 

@@ -5,10 +5,10 @@ from .pii import PIIDetector, mask_pii_in_text, scan_for_pii
 from .schemas import (
     CustomerServiceRequest,
     CustomerServiceResponse,
+    ErrorResponse,
     FinanceRAGRequest,
     FinanceRAGResponse,
     HealthResponse,
-    ErrorResponse,
 )
 
 __all__ = [

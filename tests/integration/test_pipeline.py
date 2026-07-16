@@ -1,115 +1,153 @@
-"""
-Integration Tests
-
-Tests the complete pipeline from SOP to trained model.
-"""
+"""Integration tests for the complete Round 2 pipeline."""
 
 import json
 import tempfile
-import pytest
 from pathlib import Path
+
+import pytest
 
 from src.ecommerce.dataset import (
     SOPBuilder,
     CanonicalCaseGenerator,
+    PolicyEngine,
+    PipelineConfig,
+    validate_canonical_cases,
+    run_pipeline,
+)
+from src.ecommerce.dataset.conversation_generator import (
     ConversationGenerator,
-    DataPipeline,
 )
 
 
-class TestCompletePipeline:
-    """Test complete data pipeline."""
-
-    def test_end_to_end_pipeline(self):
-        """Test full pipeline from SOP to train/dev/test split."""
-        # Step 1: Build SOPs
+class TestPolicyCaseRoundtrip:
+    def test_sop_to_cases_to_validate(self, tmp_path):
         builder = SOPBuilder()
         policies = builder.build_fictional_store_sops()
         policies_dict = [p.to_dict() for p in policies]
-        
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            policies_path = f.name
-            json.dump(policies_dict, f)
-        
-        # Step 2: Generate canonical cases
-        generator = CanonicalCaseGenerator()
-        cases = generator.generate_all()
-        
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
-            cases_path = f.name
-        
-        generator.save_cases(cases_path)
-        
-        # Step 3: Generate conversations
-        with open(policies_path, 'r') as f:
-            policies_for_gen = json.load(f)
-        
-        conv_gen = ConversationGenerator(policies=policies_for_gen, seed=42)
-        convs = conv_gen.generate_from_cases(cases, samples_per_case=2)
-        
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
-            convs_path = f.name
-        
-        conv_gen.save_conversations(convs_path)
-        
-        # Step 4: Run pipeline
-        pipeline = DataPipeline(policies=policies_for_gen, seed=42)
-        
-        with tempfile.TemporaryDirectory() as tmpdir:
-            splits = pipeline.process(
-                input_path=convs_path,
-                output_dir=tmpdir,
-                train_ratio=0.8,
-                dev_ratio=0.1,
-                test_ratio=0.1,
+        policies_path = tmp_path / "policies.json"
+        policies_path.write_text(json.dumps(policies_dict, ensure_ascii=False))
+
+        gen = CanonicalCaseGenerator()
+        cases = gen.generate_all()
+        cases_path = tmp_path / "cases.jsonl"
+        gen.save_cases(cases, str(cases_path))
+
+        loaded = [
+            json.loads(line)
+            for line in cases_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert len(loaded) == len(cases) > 0
+
+        severity, errors = validate_canonical_cases(policies_dict, loaded)
+        assert severity == 0, errors
+
+        engine = PolicyEngine(policies_dict)
+        engine_categories = {p["policy_id"] for p in policies_dict}
+        referenced = set()
+        for case in loaded:
+            for pid in case.get("expected_policy_ids") or []:
+                if pid:
+                    referenced.add(pid)
+        assert referenced.issubset(engine_categories), referenced - engine_categories
+
+
+class TestConversationGeneratorCLI:
+    def test_conversation_generator_cli_runs(self, tmp_path):
+        builder = SOPBuilder()
+        policies = [p.to_dict() for p in builder.build_fictional_store_sops()]
+        policies_path = tmp_path / "policies.json"
+        policies_path.write_text(json.dumps(policies, ensure_ascii=False))
+
+        gen = CanonicalCaseGenerator()
+        cases = [c.to_dict() for c in gen.generate_all()]
+        cases_path = tmp_path / "cases.jsonl"
+        gen.save_cases(cases, str(cases_path))
+
+        out_path = tmp_path / "convs.jsonl"
+        cg = ConversationGenerator(
+            policies=policies,
+            seed=42,
+            mode="fixture",
+            source_id="owned_sop_v1",
+        )
+        cg.run(str(out_path), cases=cases)
+
+        lines = [
+            l
+            for l in out_path.read_text(encoding="utf-8").splitlines()
+            if l.strip()
+        ]
+        assert len(lines) >= 1
+        first = json.loads(lines[0])
+        assert "messages" in first and first["messages"]
+        assert first["messages"][0]["role"] == "system"
+        # Subsequent messages must alternate user/assistant and end on assistant.
+        roles = [m["role"] for m in first["messages"]]
+        assert roles[-1] == "assistant"
+        assert roles[0] == "system"
+        # No two adjacent same-role messages.
+        for a, b in zip(roles, roles[1:]):
+            assert a != b
+
+
+class TestDataPipelineRoundtrip:
+    def test_data_pipeline_process(self, tmp_path):
+        builder = SOPBuilder()
+        policies = [p.to_dict() for p in builder.build_fictional_store_sops()]
+        gen = CanonicalCaseGenerator()
+        cases = [c.to_dict() for c in gen.generate_all()]
+        cases_path = tmp_path / "cases.jsonl"
+        gen.save_cases(cases, str(cases_path))
+
+        out_path = tmp_path / "convs.jsonl"
+        ConversationGenerator(
+            policies=policies,
+            seed=7,
+            mode="fixture",
+            source_id="owned_sop_v1",
+        ).run(str(out_path), cases=cases)
+
+        policy_path = tmp_path / "policies.json"
+        policy_path.write_text(json.dumps(policies, ensure_ascii=False))
+
+        registry_path = tmp_path / "registry.json"
+        registry_path.write_text(
+            json.dumps(
+                {
+                    "sources": [
+                        {
+                            "source_id": "owned_sop_v1",
+                            "source_name": "Owned SOP Policies v1",
+                            "license": "internal",
+                            "allowed_train": True,
+                            "allowed_evaluate": True,
+                            "checksum_sha256": "deadbeef",
+                            "status": "validated",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
             )
-            
-            # Verify splits
-            assert "train" in splits
-            assert "dev" in splits
-            assert "test" in splits
-            
-            # Check split files exist
-            train_path = Path(tmpdir) / "train.jsonl"
-            dev_path = Path(tmpdir) / "dev.jsonl"
-            test_path = Path(tmpdir) / "test.jsonl"
-            
-            assert train_path.exists()
-            assert dev_path.exists()
-            assert test_path.exists()
-            
-            # Verify samples have split field
-            with open(train_path) as f:
-                train_samples = [json.loads(line) for line in f]
-            
-            assert all(s.get("split") == "train" for s in train_samples)
-        
-        # Cleanup
-        Path(policies_path).unlink(missing_ok=True)
-        Path(cases_path).unlink(missing_ok=True)
-        Path(convs_path).unlink(missing_ok=True)
+        )
 
+        output_dir = tmp_path / "out"
+        config = PipelineConfig(seed=42, mode="fixture")
+        result = run_pipeline(
+            str(out_path),
+            str(policy_path),
+            str(registry_path),
+            str(output_dir),
+            config,
+        )
 
-class TestPolicyCaseConsistency:
-    """Test policy and case consistency."""
-
-    def test_case_policy_ids_exist(self):
-        """Test that all case policy references exist."""
-        builder = SOPBuilder()
-        policies = builder.build_fictional_store_sops()
-        policies_dict = [p.to_dict() for p in policies]
-        policy_ids = {p["policy_id"] for p in policies_dict}
-        
-        generator = CanonicalCaseGenerator()
-        cases = generator.generate_all()
-        
-        errors = []
-        for case in cases:
-            for policy_id in case.expected_policy_ids:
-                if policy_id and policy_id not in policy_ids:
-                    errors.append(f"Case {case.case_id}: missing policy {policy_id}")
-        
-        assert len(errors) == 0, f"Missing policies: {errors}"
+        assert result["exit_ok"] is True
+        funnel = result["funnel"]
+        # All training-eligible samples should reach the output stage.
+        assert funnel["stage_counts"]["final"] > 0
+        # And there must be no policy inconsistencies.
+        assert funnel.get("policy_inconsistent", 0) == 0
+        assert funnel.get("invalid_roles", 0) == 0
 
 
 if __name__ == "__main__":

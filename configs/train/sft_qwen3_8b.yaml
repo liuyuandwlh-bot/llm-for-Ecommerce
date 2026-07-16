@@ -2,7 +2,7 @@
 
 model:
   name: "Qwen/Qwen3-8B"
-  revision: "main"
+  revision: "v0.0.0"  # user can pin to a specific snapshot
   trust_remote_code: true
   chat_template: "qwen"
 

@@ -1,0 +1,68 @@
+MIT License
+
+Copyright (c) 2026 Portfolio Author
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+THIRD-PARTY DATA AND MODEL NOTICES
+================================================================================
+
+This project includes example/orchestration code only. It does NOT bundle any
+of the proprietary datasets or model weights referenced below. Operators are
+responsible for sourcing, licensing, and providing their own data and weights.
+
+1. E-COMMERCE TRAINING DATA (3C CUSTOMER-SERVICE CONVERSATIONS)
+   - All canonical cases, SOP policies and synthetic conversations produced by
+     this codebase are seeded from public-domain or self-authored fixtures
+     (`src/ecommerce/dataset/fixtures`). No proprietary customer-service
+     transcripts are shipped.
+   - The data registry (`src/ecommerce/dataset/registry.py`) treats any
+     `source_id == "owned_sop_v1"` entry as owned, self-authored material
+     suitable for `train` and `evaluate` usage.
+   - External sources MUST be registered with an explicit `license_note`
+     and the pipeline refuses to use any source whose `usage_permissions`
+     does not include the requested flag.
+
+2. FINANCIAL RAG DATA (ANNUAL/POLICY DISCLOSURES)
+   - The chunker, parser and retriever operate on documents that you supply.
+     This repository ships ONLY a single self-authored fixture at
+     `data/fixtures/finance/parsed/fixture_a_2024.json` and a manifest pointing
+     to it; nothing in this repo is scraped from Cninfo/SE/PBoC/NDRC or any
+     other real disclosure portal.
+   - When you add real PDFs, populate `data/raw/reports/document_manifest.json`
+     with their original URLs, publisher, publication date, license note and
+     a SHA-256 checksum of the bytes.
+
+3. EMBEDDING / GENERATION MODELS
+   - The default `RealEmbeddingBackend` references `BAAI/bge-m3`. Operators
+     MUST accept the model's license on Hugging Face before downloading and
+     pinning the revision in their config.
+   - The SFT configs (`configs/train/sft_qwen3_8b.yaml`,
+     `sft_llama3_8b.yaml`) reference third-party base models
+     (Qwen3-8B, Llama-3-8B-Instruct). Operators MUST accept the relevant
+     licenses (Apache-2.0 for Qwen3, the Llama 3 Community License for
+     Llama-3) before any training run.
+   - DPO is intentionally left experimental; preference data MUST be
+     collected and licensed by the operator.
+
+4. NO REDISTRIBUTION
+   - The pipeline defaults treat `license_note` values starting with
+     `official-disclosure` as `local-research; no-redistribution`. Such
+     records may be used for offline evaluation but MUST NOT be re-shared.

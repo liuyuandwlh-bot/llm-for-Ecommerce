@@ -6,18 +6,17 @@ Domain routing and endpoint definitions.
 
 import time
 import uuid
-from fastapi import APIRouter, Request, HTTPException, BackgroundTasks
-from typing import Optional, List
+
+from fastapi import APIRouter, HTTPException, Request
 
 from src.common.logging_utils import get_logger
+from src.common.pii import mask_pii_in_text
 from src.common.schemas import (
     CustomerServiceRequest,
     CustomerServiceResponse,
     FinanceRAGRequest,
     FinanceRAGResponse,
-    ErrorResponse,
 )
-from src.common.pii import mask_pii_in_text
 
 logger = get_logger(__name__)
 
@@ -34,12 +33,12 @@ def create_router() -> APIRouter:
         Routes to:
         - E-commerce customer service (with LoRA adapter)
         - Financial Q&A (with RAG)
-        
+
         Returns mock response when model not loaded.
         """
         start_time = time.time()
         request_id = str(uuid.uuid4())[:8]
-        
+
         # Log request (with masked PII)
         masked_query = mask_pii_in_text(request.query)
         logger.info(f"[{request_id}] Customer service request: %s", masked_query)
@@ -47,7 +46,7 @@ def create_router() -> APIRouter:
         # Validate domain
         if request.domain not in ["ecommerce", "finance"]:
             raise HTTPException(
-                status_code=400, 
+                status_code=400,
                 detail="Only 'ecommerce' or 'finance' domain supported"
             )
 
@@ -70,8 +69,8 @@ def create_router() -> APIRouter:
             )
 
         except Exception as e:
-            logger.error(f"[{request_id}] Customer service error: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+            logger.error(f"[{request_id}] Customer service error: %s", e)
+            raise HTTPException(status_code=500, detail=str(e)) from e
 
     @router.post("/api/v1/finance-rag", response_model=FinanceRAGResponse)
     async def finance_rag(request: FinanceRAGRequest, req: Request):
@@ -83,7 +82,7 @@ def create_router() -> APIRouter:
         """
         start_time = time.time()
         request_id = str(uuid.uuid4())[:8]
-        
+
         # Log request (with masked PII)
         masked_query = mask_pii_in_text(request.query)
         logger.info(f"[{request_id}] Finance RAG request: %s", masked_query)
@@ -91,7 +90,7 @@ def create_router() -> APIRouter:
         # Validate domain
         if request.domain != "finance":
             raise HTTPException(
-                status_code=400, 
+                status_code=400,
                 detail="Only 'finance' domain supported"
             )
 
@@ -99,7 +98,7 @@ def create_router() -> APIRouter:
             # TODO: Call actual RAG pipeline
             # In production: document retrieval -> reranking -> answer generation
 
-            response_text = f"[金融RAG-MOCK] 已检索相关信息回答您的问题。"
+            response_text = "[金融RAG-MOCK] 已检索相关信息回答您的问题。"
 
             return FinanceRAGResponse(
                 answer=response_text,
@@ -111,17 +110,17 @@ def create_router() -> APIRouter:
             )
 
         except Exception as e:
-            logger.error(f"[{request_id}] Finance RAG error: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+            logger.error(f"[{request_id}] Finance RAG error: %s", e)
+            raise HTTPException(status_code=500, detail=str(e)) from e
 
     @router.post("/api/v1/batch")
     async def batch_predict(
-        requests: List[CustomerServiceRequest], 
+        requests: list[CustomerServiceRequest],
         req: Request
     ):
         """
         Batch prediction endpoint.
-        
+
         Limited to 100 requests per batch.
         """
         # Limit batch size
@@ -130,7 +129,7 @@ def create_router() -> APIRouter:
                 status_code=400,
                 detail="Batch size limited to 100 requests"
             )
-        
+
         responses = []
         for request in requests:
             result = await customer_service(request, req)

@@ -7,11 +7,9 @@ Based on recommended plan:
 - Page-level tracking for citations
 """
 
-import re
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
-from pathlib import Path
 import json
+from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass
@@ -19,12 +17,12 @@ class TextBlock:
     """A block of text with position information."""
     text: str
     page: int
-    bbox: Tuple[float, float, float, float]  # x0, y0, x1, y1
-    font: Optional[str] = None
-    font_size: Optional[float] = None
+    bbox: tuple[float, float, float, float]  # x0, y0, x1, y1
+    font: str | None = None
+    font_size: float | None = None
     is_header: bool = False
     is_footer: bool = False
-    section: Optional[str] = None
+    section: str | None = None
 
 
 @dataclass
@@ -33,17 +31,17 @@ class TableCell:
     text: str
     row: int
     col: int
-    bbox: Tuple[float, float, float, float]
+    bbox: tuple[float, float, float, float]
     is_header: bool = False
 
 
 @dataclass
 class Table:
     """A table with cells."""
-    cells: List[List[str]]
+    cells: list[list[str]]
     page: int
-    bbox: Tuple[float, float, float, float]
-    headers: List[str]
+    bbox: tuple[float, float, float, float]
+    headers: list[str]
     markdown: str  # Markdown representation
 
     def to_markdown(self) -> str:
@@ -65,9 +63,9 @@ class Table:
 class ParsedPage:
     """A parsed page with text blocks and tables."""
     page_num: int
-    blocks: List[TextBlock]
-    tables: List[Table]
-    metadata: Dict = field(default_factory=dict)
+    blocks: list[TextBlock]
+    tables: list[Table]
+    metadata: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -75,8 +73,8 @@ class ParsedDocument:
     """A fully parsed document."""
     doc_id: str
     title: str
-    pages: List[ParsedPage]
-    metadata: Dict = field(default_factory=dict)
+    pages: list[ParsedPage]
+    metadata: dict = field(default_factory=dict)
 
     def get_all_text(self) -> str:
         """Get all text from document."""
@@ -143,7 +141,7 @@ class PDFParser:
         self,
         pdf_path: Path,
         doc_id: str,
-        title: Optional[str] = None,
+        title: str | None = None,
     ) -> ParsedDocument:
         """Parse a PDF document."""
         if self.parser_type == "pdfplumber":
@@ -159,7 +157,7 @@ class PDFParser:
         self,
         pdf_path: Path,
         doc_id: str,
-        title: Optional[str] = None,
+        title: str | None = None,
     ) -> ParsedDocument:
         """Parse with pdfplumber (good for tables)."""
         import pdfplumber
@@ -248,7 +246,7 @@ class PDFParser:
         self,
         pdf_path: Path,
         doc_id: str,
-        title: Optional[str] = None,
+        title: str | None = None,
     ) -> ParsedDocument:
         """Parse with PyMuPDF (fast, basic)."""
         import fitz
@@ -300,12 +298,11 @@ class PDFParser:
         self,
         pdf_path: Path,
         doc_id: str,
-        title: Optional[str] = None,
+        title: str | None = None,
     ) -> ParsedDocument:
         """Parse with Docling (best for complex layouts)."""
         # Docling integration
         try:
-            from docling.datamodel.base_models import InputDocument
             from docling.document_converter import DocumentConverter
 
             converter = DocumentConverter()
@@ -337,20 +334,20 @@ class PDFParser:
 
     def _identify_headers_footers(
         self,
-        blocks: List[TextBlock],
+        blocks: list[TextBlock],
         page_num: int,
         page_height: float,
-    ) -> List[TextBlock]:
+    ) -> list[TextBlock]:
         """Identify and mark headers and footers."""
-        HEADER_THRESHOLD = 50  # pixels from top
-        FOOTER_THRESHOLD = 50  # pixels from bottom
+        header_threshold = 50  # pixels from top
+        footer_threshold = 50  # pixels from bottom
 
         for block in blocks:
             y0 = block.bbox[1]
 
-            if y0 < HEADER_THRESHOLD:
+            if y0 < header_threshold:
                 block.is_header = True
-            elif page_height - y0 < FOOTER_THRESHOLD:
+            elif page_height - y0 < footer_threshold:
                 block.is_footer = True
 
         return blocks
@@ -360,8 +357,8 @@ def parse_batch(
     input_dir: str,
     output_dir: str,
     parser_type: str = "pdfplumber",
-    doc_ids: Optional[List[str]] = None,
-) -> List[ParsedDocument]:
+    doc_ids: list[str] | None = None,
+) -> list[ParsedDocument]:
     """Parse a batch of PDF documents."""
     input_path = Path(input_dir)
     output_path = Path(output_dir)

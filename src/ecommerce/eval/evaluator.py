@@ -1,412 +1,290 @@
 """
-Customer Service Model Evaluator
+Customer-service evaluator - Round 2 rewrite.
 
-Evaluates customer service models using gold test sets.
-Supports both real model evaluation and fixture-based testing.
+Goals:
+- The CLI works without torch/transformers installed (lazy imports).
+- Mock and oracle backends are clearly labelled in the output and are NOT
+  promoted as model performance.
+- All metrics come from `src.ecommerce.eval.metrics.summarize_evaluation`.
+- Both SFT-style messages and canonical `turns` are supported as input.
 """
 
-import json
 import argparse
+import json
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional
 from pathlib import Path
-
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import PeftModel
+from typing import Any
 
 from .metrics import (
-    IntentAccuracy,
-    SlotF1,
-    PolicyAccuracy,
-    SafetyMetrics,
-    GenerationMetrics,
-    EvaluationSample,
-    calculate_intent_metrics,
-    calculate_slot_metrics,
-    check_pii_leak,
-    check_injection,
-    calculate_rouge,
-    calculate_bleu,
+    Prediction,
+    parse_prediction,
+    summarize_evaluation,
 )
+
+_BACKEND_TYPES = ("fixture_oracle", "mock", "real_model")
 
 
 @dataclass
-class EvaluationResult:
-    """Complete evaluation results."""
-    num_samples: int
-    intent_accuracy: IntentAccuracy
-    slot_f1: SlotF1
-    policy_accuracy: PolicyAccuracy
-    safety_metrics: SafetyMetrics
-    generation_metrics: GenerationMetrics
-    samples: List[EvaluationSample] = field(default_factory=list)
-    bad_cases: List[EvaluationSample] = field(default_factory=list)
-    metadata: Dict = field(default_factory=dict)
-
-    def to_dict(self) -> dict:
-        return {
-            "num_samples": self.num_samples,
-            "intent_accuracy": {
-                "accuracy": self.intent_accuracy.accuracy,
-                "macro_f1": self.intent_accuracy.macro_f1,
-                "micro_f1": self.intent_accuracy.micro_f1,
-            },
-            "slot_f1": {
-                "macro_f1": self.slot_f1.macro_f1,
-                "micro_f1": self.slot_f1.micro_f1,
-            },
-            "policy_accuracy": {
-                "accuracy": self.policy_accuracy.accuracy,
-                "correct": self.policy_accuracy.correct_count,
-                "total": self.policy_accuracy.total_count,
-            },
-            "safety_metrics": {
-                "pii_leak_rate": self.safety_metrics.pii_leak_rate,
-                "injection_rate": self.safety_metrics.injection_success_rate,
-            },
-            "num_bad_cases": len(self.bad_cases),
-            "metadata": self.metadata,
-        }
-
-    def save(self, output_path: str):
-        """Save evaluation results."""
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
+class EvaluatorConfig:
+    backend: str = "fixture_oracle"
+    base_model: str = ""
+    seed: int = 42
+    generation_config: dict[str, Any] = field(default_factory=dict)
 
 
-class CustomerServiceEvaluator:
+def _extract_first_user_text(sample: dict[str, Any]) -> str:
+    """Pull the user-side text from either `messages` or `turns`."""
+    if sample.get("messages"):
+        for m in sample["messages"]:
+            if m.get("role") == "user":
+                return m.get("content") or ""
+    if sample.get("turns"):
+        for m in sample["turns"]:
+            if m.get("role") == "user":
+                return m.get("content") or ""
+    return sample.get("query") or sample.get("user_text") or ""
+
+
+def _to_reference(sample: dict[str, Any]) -> dict[str, Any]:
+    """Build the reference dict used by ``summarize_evaluation``."""
+    return {
+        "intent": sample.get("intent", "unknown"),
+        "slots": sample.get("slots") or sample.get("context") or {},
+        "policy_ids": list(sample.get("policy_ids") or sample.get("expected_policy_ids") or []),
+        "decision": sample.get("decision") or sample.get("expected_decision") or "need_more_info",
+        "expected_missing_slots": list(sample.get("expected_missing_slots") or sample.get("missing_slots") or []),
+        "requires_human": bool(sample.get("requires_human", False)),
+        "tool_expectation_dict": sample.get("tool_expectation_dict"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Backends
+# ---------------------------------------------------------------------------
+
+
+def _prediction_to_dict(p: Prediction) -> dict[str, Any]:
+    return {
+        "intent": p.intent,
+        "slots": dict(p.slots or {}),
+        "policy_ids": list(p.policy_ids or []),
+        "decision": p.decision,
+        "missing_slots": list(p.missing_slots or []),
+        "requires_human": bool(p.requires_human),
+        "tool_call": dict(p.tool_call) if isinstance(p.tool_call, dict) else None,
+        "response": str(p.response or ""),
+    }
+
+
+def _fixture_oracle_predict(sample: dict[str, Any]) -> tuple[bool, Prediction | None, str | None]:
+    """Use the canonical labels as the prediction. Returns (ok, pred, error)."""
+    try:
+        pred = Prediction(
+            intent=sample.get("intent"),
+            slots=dict(sample.get("slots") or sample.get("context") or {}),
+            policy_ids=list(sample.get("policy_ids") or sample.get("expected_policy_ids") or []),
+            decision=sample.get("decision") or sample.get("expected_decision") or "need_more_info",
+            missing_slots=list(sample.get("expected_missing_slots") or []),
+            requires_human=bool(sample.get("requires_human", False)),
+            tool_call=None,
+            response=sample.get("response", ""),
+        )
+        return True, pred, None
+    except Exception as exc:  # pragma: no cover
+        return False, None, str(exc)
+
+
+def _mock_predict(sample: dict[str, Any]) -> tuple[bool, Prediction | None, str | None]:
+    """Mock backend: deterministic placeholder predictions.
+
+    Returns a partial prediction with intent guessed from keyword overlap and
+    ``decision`` left blank so the metric reports a parse failure or a
+    wrong decision - never a synthetic correct answer.
     """
-    Evaluator for customer service models.
-    
-    Evaluates models across multiple dimensions:
-    - Intent classification accuracy
-    - Slot extraction F1
-    - Policy decision accuracy
-    - Safety metrics
-    - Generation quality
-    """
-
-    def __init__(
-        self,
-        model_path: Optional[str] = None,
-        base_model: str = "Qwen/Qwen3-8B",
-        device: str = "auto",
-        max_length: int = 2048,
-    ):
-        self.model_path = model_path
-        self.base_model = base_model
-        self.max_length = max_length
-        
-        # Parse device string
-        if device == "auto":
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        else:
-            self.device = device
-
-        self.model = None
-        self.tokenizer = None
-        self._is_mock = True
-
-    def load_model(self):
-        """Load model and tokenizer."""
-        if self.model_path is None:
-            print("No model path provided - using mock mode")
-            self._is_mock = True
-            return
-        
-        print(f"Loading model from: {self.model_path}")
-        
-        self._is_mock = False
-        
-        # Load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.base_model,
-            trust_remote_code=True,
-            padding_side="right",
-        )
-        
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        # Load model
-        if self.model_path and ("checkpoint" in str(self.model_path) or "adapter" in str(self.model_path)):
-            base = AutoModelForCausalLM.from_pretrained(
-                self.base_model,
-                torch_dtype=torch.bfloat16,
-                device_map=self.device,
-                trust_remote_code=True,
-            )
-            self.model = PeftModel.from_pretrained(base, self.model_path)
-        else:
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_path,
-                torch_dtype=torch.bfloat16,
-                device_map=self.device,
-                trust_remote_code=True,
-            )
-
-        self.model.eval()
-        print("Model loaded successfully")
-
-    def generate_response(
-        self,
-        query: str,
-        system_prompt: Optional[str] = None,
-        history: Optional[List[Dict]] = None,
-    ) -> str:
-        """Generate a single response."""
-        if self._is_mock:
-            return f"[MOCK] 已收到您的问题：{query}"
-        
-        if self.model is None:
-            self.load_model()
-
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        if history:
-            messages.extend(history)
-        messages.append({"role": "user", "content": query})
-
-        text = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-
-        inputs = self.tokenizer(
-            text,
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.max_length,
-        ).to(self.device)
-
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=512,
-                temperature=0.7,
-                do_sample=True,
-                top_p=0.9,
-                repetition_penalty=1.1,
-            )
-
-        response = self.tokenizer.decode(
-            outputs[0][inputs.input_ids.shape[1]:],
-            skip_special_tokens=True,
-        )
-
-        return response.strip()
-
-    def predict_intent(self, query: str) -> str:
-        """Predict intent from query (placeholder - should use trained classifier)."""
-        # Simple keyword-based prediction for demo
-        if any(kw in query for kw in ["退货", "退款", "退"]):
-            return "return_query"
-        elif any(kw in query for kw in ["换货", "换"]):
-            return "exchange_query"
-        elif any(kw in query for kw in ["物流", "快递", "发货", "签收"]):
-            return "logistics_query"
-        elif any(kw in query for kw in ["优惠", "降价", "差价", "优惠券"]):
-            return "coupon_or_price_protection"
-        elif any(kw in query for kw in ["投诉", "经理"]):
-            return "complaint"
-        elif any(kw in query for kw in ["兼容", "支持"]):
-            return "specification_query"
-        else:
-            return "unknown"
-
-    def evaluate_sample(self, sample: dict) -> EvaluationSample:
-        """Evaluate a single sample."""
-        query = sample.get("query", sample.get("messages", [{}])[0].get("content", ""))
-        
-        # Generate prediction
-        system_prompt = """你是一个专业、热情的3C电子产品店客服，很乐意帮助用户解决问题。
-重要原则：
-1. 只依据给出的政策信息回答，不要编造
-2. 缺少订单信息时先澄清，不要猜测
-3. 不确定时建议转人工
-4. 保持礼貌和专业"""
-
-        prediction = self.generate_response(query, system_prompt)
-
-        # Predict intent
-        intent_pred = self.predict_intent(query)
-        intent_true = sample.get("intent", "")
-
-        # Check safety
-        has_pii = check_pii_leak(prediction)
-        has_injection = check_injection(prediction)
-
-        return EvaluationSample(
-            sample_id=sample.get("sample_id", ""),
-            query=query,
-            reference=sample.get("reference", ""),
-            prediction=prediction,
-            intent_pred=intent_pred,
-            intent_true=intent_true,
-            slots_pred={},
-            slots_true=sample.get("slots", {}),
-            policy_id_true=sample.get("policy_ids", [""])[0] if sample.get("policy_ids") else "",
-            policy_id_pred="",
-            decision_correct=self._check_decision(prediction, sample.get("decision", "")),
-            safety_passed=not has_pii and not has_injection,
-        )
-
-    def _check_decision(self, prediction: str, expected_decision: str) -> bool:
-        """Check if prediction matches expected decision."""
-        # Simple heuristic - in production use proper NER/classification
-        if expected_decision == "full_refund":
-            return "退款" in prediction or "退货" in prediction
-        elif expected_decision == "reject":
-            return "无法" in prediction or "抱歉" in prediction
-        elif expected_decision == "escalate":
-            return "转接" in prediction or "人工" in prediction
-        return len(prediction) > 0
-
-    def evaluate(
-        self,
-        test_data_path: str,
-        output_path: Optional[str] = None,
-    ) -> EvaluationResult:
-        """Run full evaluation."""
-        # Load model if needed
-        if self.model is None:
-            self.load_model()
-
-        # Load test data
-        print(f"Loading test data from: {test_data_path}")
-        
-        test_data = []
-        with open(test_data_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                test_data.append(json.loads(line))
-
-        print(f"Evaluating {len(test_data)} samples...")
-
-        samples = []
-        for sample in test_data:
-            eval_sample = self.evaluate_sample(sample)
-            samples.append(eval_sample)
-
-        # Calculate metrics
-        print("Calculating metrics...")
-
-        # Intent metrics
-        intent_preds = [s.intent_pred for s in samples]
-        intent_refs = [s.intent_true for s in samples]
-        intent_accuracy = calculate_intent_metrics(intent_preds, intent_refs)
-
-        # Slot metrics
-        slot_preds = [s.slots_pred for s in samples]
-        slot_refs = [s.slots_true for s in samples]
-        slot_f1 = calculate_slot_metrics(slot_preds, slot_refs)
-
-        # Policy accuracy
-        correct_count = sum(1 for s in samples if s.decision_correct)
-        policy_accuracy = PolicyAccuracy(
-            accuracy=correct_count / len(samples) if samples else 0,
-            correct_count=correct_count,
-            total_count=len(samples),
-            policy_wise_accuracy={},
-        )
-
-        # Safety metrics
-        pii_leaks = sum(1 for s in samples if check_pii_leak(s.prediction))
-        injection_success = sum(1 for s in samples if check_injection(s.prediction))
-
-        safety_metrics = SafetyMetrics(
-            pii_leak_rate=pii_leaks / len(samples) if samples else 0,
-            injection_success_rate=injection_success / len(samples) if samples else 0,
-        )
-
-        # Generation metrics
-        generation_metrics = GenerationMetrics(
-            rouge_l=0.0,
-            bleu_4=0.0,
-            pairwise_win_rate=0.0,
-            pairwise_win_rate_ci=(0.0, 0.0),
-        )
-
-        # Collect bad cases
-        bad_cases = [
-            s for s in samples
-            if not s.decision_correct or not s.safety_passed
-        ]
-
-        result = EvaluationResult(
-            num_samples=len(samples),
-            intent_accuracy=intent_accuracy,
-            slot_f1=slot_f1,
-            policy_accuracy=policy_accuracy,
-            safety_metrics=safety_metrics,
-            generation_metrics=generation_metrics,
-            samples=samples,
-            bad_cases=bad_cases,
-            metadata={
-                "model_path": self.model_path or "mock",
-                "test_data_path": test_data_path,
-                "is_mock": self._is_mock,
-            },
-        )
-
-        if output_path:
-            result.save(output_path)
-            print(f"Results saved to: {output_path}")
-
-        # Print summary
-        self.print_summary(result)
-
-        return result
-
-    def print_summary(self, result: EvaluationResult):
-        """Print evaluation summary."""
-        print("\n" + "=" * 60)
-        print("EVALUATION SUMMARY")
-        print("=" * 60)
-        print(f"Total samples: {result.num_samples}")
-        print(f"Bad cases: {len(result.bad_cases)}")
-        print(f"Mode: {'MOCK' if result.metadata.get('is_mock') else 'REAL MODEL'}")
-
-        print("\n--- Intent Accuracy ---")
-        print(f"  Accuracy: {result.intent_accuracy.accuracy:.4f}")
-        print(f"  Macro F1: {result.intent_accuracy.macro_f1:.4f}")
-        print(f"  Micro F1: {result.intent_accuracy.micro_f1:.4f}")
-
-        print("\n--- Slot F1 ---")
-        print(f"  Macro F1: {result.slot_f1.macro_f1:.4f}")
-        print(f"  Micro F1: {result.slot_f1.micro_f1:.4f}")
-
-        print("\n--- Policy Accuracy ---")
-        print(f"  Accuracy: {result.policy_accuracy.accuracy:.4f}")
-        print(f"  Correct: {result.policy_accuracy.correct_count}/{result.policy_accuracy.total_count}")
-
-        print("\n--- Safety ---")
-        print(f"  PII leak rate: {result.safety_metrics.pii_leak_rate:.4f}")
-        print(f"  Injection rate: {result.safety_metrics.injection_success_rate:.4f}")
-
-        print("\nNote: ROUGE/BLEU/pairwise metrics require reference responses and human evaluation.")
-        print("=" * 60)
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Evaluate customer service model")
-    parser.add_argument("--model_path", type=str, help="Path to model checkpoint")
-    parser.add_argument("--test_data", type=str, help="Path to test data JSONL")
-    parser.add_argument("--output", type=str, help="Path to save results")
-    parser.add_argument("--base_model", type=str, default="Qwen/Qwen3-8B")
-    
-    args = parser.parse_args()
-    
-    evaluator = CustomerServiceEvaluator(
-        model_path=args.model_path,
-        base_model=args.base_model,
+    text = _extract_first_user_text(sample)
+    intent = "unknown"
+    if any(k in text for k in ("退", "退款")):
+        intent = "return_query"
+    elif any(k in text for k in ("换",)):
+        intent = "exchange_query"
+    elif any(k in text for k in ("物流", "发货", "快递")):
+        intent = "logistics_query"
+    elif any(k in text for k in ("价", "券", "优惠")):
+        intent = "coupon_or_price_protection"
+    elif any(k in text for k in ("兼容", "支持")):
+        intent = "specification_query"
+    elif any(k in text for k in ("投诉", "经理")):
+        intent = "complaint"
+    pred = Prediction(
+        intent=intent,
+        slots={},
+        policy_ids=[],
+        decision=None,
+        missing_slots=[],
+        requires_human=False,
+        tool_call=None,
+        response="[MOCK]",
     )
-    
-    # Use fixture if no test data provided
-    test_data = args.test_data or "data/fixtures/ecommerce/canonical_cases.jsonl"
-    
-    evaluator.evaluate(test_data, args.output)
+    return True, pred, None
+
+
+def _real_model_predict(
+    sample: dict[str, Any],
+    model: Any = None,
+    tokenizer: Any = None,
+    generation_config: dict[str, Any] | None = None,
+) -> tuple[bool, Prediction | None, str | None]:
+    """Real-model backend. Heavy imports happen lazily."""
+    try:
+        import torch  # noqa: F401
+    except ImportError as exc:  # pragma: no cover
+        return False, None, f"real_model backend requires torch ({exc})"
+    if model is None or tokenizer is None:
+        return False, None, "real_model backend requires model and tokenizer"
+
+    text = _extract_first_user_text(sample)
+    messages = [
+        {"role": "system", "content": "你是3C数码店客服助手，请根据用户问题预测结构化字段。"},
+        {"role": "user", "content": text or ""},
+    ]
+    try:
+        chat = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = tokenizer(chat, return_tensors="pt", truncation=True, max_length=2048)
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        gen_cfg = {
+            "max_new_tokens": 256,
+            "do_sample": False,
+            "temperature": 0.0,
+        }
+        if generation_config:
+            gen_cfg.update(generation_config)
+        with torch.no_grad():
+            outputs = model.generate(**inputs, **gen_cfg)
+        decoded = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+    except Exception as exc:  # pragma: no cover
+        return False, None, f"generation failed: {exc}"
+    return parse_prediction(decoded)
+
+
+# ---------------------------------------------------------------------------
+# Loader / runner
+# ---------------------------------------------------------------------------
+
+
+def load_test_set(path: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def run_evaluation(
+    test_path: str,
+    backend: str = "fixture_oracle",
+    output_dir: str | None = None,
+    generation_config: dict[str, Any] | None = None,
+    model_path: str | None = None,
+    base_model: str = "Qwen/Qwen3-8B",
+    seed: int = 42,
+) -> dict[str, Any]:
+    if backend not in _BACKEND_TYPES:
+        raise ValueError(f"unknown backend: {backend}")
+
+    samples = load_test_set(test_path)
+
+    records: list[dict[str, Any]] = []
+    for sample in samples:
+        if backend == "fixture_oracle":
+            ok, pred, err = _fixture_oracle_predict(sample)
+        elif backend == "mock":
+            ok, pred, err = _mock_predict(sample)
+        else:
+            ok, pred, err = _real_model_predict(
+                sample,
+                model=getattr(run_evaluation, "_model", None),
+                tokenizer=getattr(run_evaluation, "_tokenizer", None),
+                generation_config=generation_config,
+            )
+        records.append(
+            {
+                "sample_id": sample.get("sample_id") or sample.get("case_id") or f"sample-{len(records)}",
+                "parsed": _prediction_to_dict(pred) if (ok and pred is not None) else None,
+                "parse_error": err,
+                "reference": _to_reference(sample),
+            }
+        )
+
+    summary = summarize_evaluation(records)
+    summary["backend_type"] = backend
+    summary["is_model_result"] = backend == "real_model"
+    summary["seed"] = seed
+    summary["base_model"] = base_model if backend == "real_model" else ""
+    summary["test_path"] = test_path
+    summary["n_samples"] = len(samples)
+
+    if output_dir:
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        with open(out / "summary.json", "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        with open(out / "predictions.jsonl", "w", encoding="utf-8") as f:
+            for r in records:
+                f.write(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n")
+        badcases = [
+            r for r in records
+            if (not r.get("parsed")) or (
+                r["parsed"]
+                and (
+                    r["parsed"]["decision"] != r["reference"]["decision"]
+                    or set(r["parsed"]["policy_ids"]) != set(r["reference"]["policy_ids"])
+                    or r["parsed"]["intent"] != r["reference"]["intent"]
+                )
+            )
+        ]
+        with open(out / "badcases.jsonl", "w", encoding="utf-8") as f:
+            for r in badcases:
+                f.write(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n")
+        with open(out / "parse_failures.jsonl", "w", encoding="utf-8") as f:
+            for r in records:
+                if not r.get("parsed"):
+                    f.write(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n")
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Customer service evaluator")
+    parser.add_argument("--backend", choices=_BACKEND_TYPES, default="fixture_oracle")
+    parser.add_argument("--test-data", required=True, help="Test JSONL path")
+    parser.add_argument("--output-dir", help="Directory for summary/predictions/badcases")
+    parser.add_argument("--base-model", default="Qwen/Qwen3-8B")
+    parser.add_argument("--model-path", default=None, help="Checkpoint for real_model backend")
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    try:
+        summary = run_evaluation(
+            test_path=args.test_data,
+            backend=args.backend,
+            output_dir=args.output_dir,
+            model_path=args.model_path,
+            base_model=args.base_model,
+            seed=args.seed,
+        )
+    except Exception as exc:
+        print(f"evaluation failed: {exc}")
+        return 1
+
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())

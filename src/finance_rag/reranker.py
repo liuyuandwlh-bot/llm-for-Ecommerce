@@ -8,7 +8,7 @@ Based on recommended plan:
 """
 
 from dataclasses import dataclass
-from typing import List, Optional
+
 import torch
 from sentence_transformers import CrossEncoder
 
@@ -57,9 +57,9 @@ class CrossEncoderReranker:
     def rerank(
         self,
         query: str,
-        results: List[dict],  # Results from retriever
+        results: list[dict],  # Results from retriever
         top_k: int = 5,
-    ) -> List[RerankResult]:
+    ) -> list[RerankResult]:
         """
         Re-rank retrieval results.
 
@@ -86,7 +86,7 @@ class CrossEncoderReranker:
 
         # Combine with original scores
         reranked = []
-        for result, score in zip(results, scores):
+        for result, score in zip(results, scores, strict=False):
             reranked.append(RerankResult(
                 chunk_id=result["chunk_id"],
                 text=result["text"],

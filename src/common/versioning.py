@@ -8,14 +8,13 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 
 @dataclass
 class VersionInfo:
     """Version information for reproducibility."""
     data_hash: str
-    model_revision: Optional[str]
+    model_revision: str | None
     code_commit: str
     config_hash: str
     timestamp: str
@@ -90,7 +89,7 @@ def get_git_commit() -> str:
             check=True,
         )
         return result.stdout.strip()
-    except:
+    except Exception:
         return "unknown"
 
 
@@ -102,8 +101,8 @@ def get_timestamp() -> str:
 
 def create_version_info(
     data_path: str,
-    model_revision: Optional[str] = None,
-    config_path: Optional[str] = None,
+    model_revision: str | None = None,
+    config_path: str | None = None,
 ) -> VersionInfo:
     """Create version info for current state."""
     data_hash = compute_data_hash(data_path)

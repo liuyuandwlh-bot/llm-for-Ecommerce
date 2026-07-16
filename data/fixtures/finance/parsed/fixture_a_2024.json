@@ -1,0 +1,46 @@
+{
+  "doc_id": "fixture_a_2024",
+  "title": "示例公司2024年年度报告（自建Fixture）",
+  "source": "self_generated_fixture",
+  "publisher": "project_author",
+  "license": "CC0",
+  "version": "v1",
+  "pages": [
+    {
+      "page_num": 1,
+      "blocks": [
+        {"text": "示例公司2024年年度报告", "is_header": false, "is_footer": false, "page": 1},
+        {"text": "一、公司基本情况", "is_header": false, "is_footer": false, "page": 1},
+        {"text": "示例公司是一家虚拟的3C数码零售企业，主营耳机、充电器、数据线和手机壳。本报告中所有数据均为虚构数据，仅用于演示 RAG 管道。", "is_header": false, "is_footer": false, "page": 1},
+        {"text": "二、营业收入与利润", "is_header": false, "is_footer": false, "page": 1},
+        {"text": "示例公司2024年营业收入为人民币12.34亿元，同比增长8.4%。其中耳机类目贡献约45%，充电器与数据线合计约30%，手机壳约15%，其他品类10%。", "is_header": false, "is_footer": false, "page": 1}
+      ],
+      "tables": [
+        {
+          "headers": ["品类", "2024营收（亿元）", "占比"],
+          "cells": [
+            ["耳机", "5.55", "45%"],
+            ["充电器与数据线", "3.70", "30%"],
+            ["手机壳", "1.85", "15%"],
+            ["其他", "1.24", "10%"]
+          ],
+          "bbox": [80.0, 360.0, 500.0, 480.0],
+          "page": 1
+        }
+      ]
+    },
+    {
+      "page_num": 2,
+      "blocks": [
+        {"text": "三、风险与展望", "is_header": false, "is_footer": false, "page": 2},
+        {"text": "公司面临的主要风险包括元器件价格上涨、平台佣金波动以及促销活动对毛利率的压缩。2025年公司将重点投入自营品类和用户复购运营。", "is_header": false, "is_footer": false, "page": 2}
+      ],
+      "tables": []
+    }
+  ],
+  "metadata": {
+    "fiscal_year": 2024,
+    "currency": "CNY",
+    "is_self_generated": true
+  }
+}

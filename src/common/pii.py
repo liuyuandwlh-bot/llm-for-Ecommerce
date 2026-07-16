@@ -6,8 +6,7 @@ of overlapping matches.
 """
 
 import re
-from dataclasses import dataclass, field
-from typing import List, Tuple, Dict, Optional, Set
+from dataclasses import dataclass
 from enum import IntEnum
 
 
@@ -35,7 +34,7 @@ class PIIMatch:
 class PIIDetector:
     """
     PII detector for common Chinese PII types.
-    
+
     Handles overlapping matches by priority and longest-match rules.
     """
 
@@ -58,7 +57,7 @@ class PIIDetector:
     ]
 
     # Placeholder templates (no real content retained)
-    PLACEHOLDERS: Dict[str, str] = {
+    PLACEHOLDERS: dict[str, str] = {
         "phone_cn": "<PHONE>",
         "phone_fixed": "<PHONE_FIXED>",
         "email": "<EMAIL>",
@@ -70,24 +69,24 @@ class PIIDetector:
 
     def __init__(self):
         # Compile patterns
-        self.compiled_patterns: List[Tuple[str, re.Pattern, PIIType]] = [
+        self.compiled_patterns: list[tuple[str, re.Pattern, PIIType]] = [
             (name, re.compile(pattern), ptype)
             for name, pattern, ptype in self.PATTERNS
         ]
-        
-        # Track entity mappings for consistent masking
-        self._entity_map: Dict[str, str] = {}
 
-    def detect(self, text: str) -> List[PIIMatch]:
+        # Track entity mappings for consistent masking
+        self._entity_map: dict[str, str] = {}
+
+    def detect(self, text: str) -> list[PIIMatch]:
         """
         Detect all PII in text.
-        
+
         Returns matches sorted by start position with overlapping
         matches resolved by priority (higher priority wins).
         """
         # Find all matches
-        all_matches: List[Tuple[int, int, str, str, PIIType]] = []
-        
+        all_matches: list[tuple[int, int, str, str, PIIType]] = []
+
         for name, pattern, ptype in self.compiled_patterns:
             for match in pattern.finditer(text):
                 all_matches.append((
@@ -97,13 +96,13 @@ class PIIDetector:
                     match.group(),
                     ptype,
                 ))
-        
+
         # Sort by start position
         all_matches.sort(key=lambda x: (x[0], -x[4]))
-        
+
         # Resolve overlapping matches using greedy non-overlapping algorithm
         resolved = self._resolve_overlaps(all_matches)
-        
+
         # Build PIIMatch objects
         matches = []
         for match_info in resolved:
@@ -116,29 +115,29 @@ class PIIDetector:
                 end=end,
                 masked=masked,
             ))
-        
+
         return matches
 
     def _resolve_overlaps(
-        self, 
-        matches: List[Tuple[int, int, str, str, PIIType]]
-    ) -> List[Tuple[int, int, str, str, PIIType]]:
+        self,
+        matches: list[tuple[int, int, str, str, PIIType]]
+    ) -> list[tuple[int, int, str, str, PIIType]]:
         """
         Resolve overlapping matches.
-        
+
         Uses greedy algorithm:
         1. Sort by start position
         2. Keep highest priority match in overlapping regions
         """
         if not matches:
             return []
-        
+
         resolved = []
         current_end = 0
-        
+
         # Sort by start, then by priority (descending)
         sorted_matches = sorted(matches, key=lambda x: (x[0], -x[4]))
-        
+
         for match_info in sorted_matches:
             start, end, pii_type, text, ptype = match_info
             if start >= current_end:
@@ -146,22 +145,22 @@ class PIIDetector:
                 resolved.append((start, end, pii_type, text, ptype))
                 current_end = end
             # else: overlapping with higher priority match, skip
-        
+
         return resolved
 
     def _get_placeholder(self, pii_type: str, text: str) -> str:
         """Get placeholder for PII type, with consistent mapping."""
         placeholder = self.PLACEHOLDERS.get(pii_type, "<PII>")
-        
+
         # For repeatable entities, track and reuse same placeholder
         # This prevents "手机号是13812345678，发到13812345678@qq.com" -> different masks
         if text in self._entity_map:
             return self._entity_map[text]
-        
+
         self._entity_map[text] = placeholder
         return placeholder
 
-    def mask(self, text: str) -> Tuple[str, List[PIIMatch]]:
+    def mask(self, text: str) -> tuple[str, list[PIIMatch]]:
         """
         Detect and mask PII in text.
 
@@ -198,7 +197,7 @@ def mask_pii(text: str) -> str:
 _detector = PIIDetector()
 
 
-def scan_for_pii(text: str) -> List[PIIMatch]:
+def scan_for_pii(text: str) -> list[PIIMatch]:
     """Scan text for PII."""
     return _detector.detect(text)
 
@@ -216,10 +215,10 @@ def mask_pii_in_text(text: str) -> str:
 def test_overlapping_phone_email():
     """Test overlapping phone number in email is handled."""
     detector = PIIDetector()
-    
+
     text = "邮箱是test13812345678@gmail.com，手机号13812345678"
     masked, matches = detector.mask(text)
-    
+
     # Should detect both but not overlap
     pii_types = [m.pii_type for m in matches]
     assert "phone_cn" in pii_types
@@ -230,11 +229,11 @@ def test_overlapping_phone_email():
 def test_overlapping_id_phone():
     """Test overlapping ID card and phone detection."""
     detector = PIIDetector()
-    
+
     # ID card ends with digits that could be phone
     text = "身份证110101199001011234，手机13812345678"
     masked, matches = detector.mask(text)
-    
+
     pii_types = [m.pii_type for m in matches]
     assert "id_card" in pii_types
     assert "phone_cn" in pii_types
@@ -244,10 +243,10 @@ def test_overlapping_id_phone():
 def test_consistent_entity_mapping():
     """Test same entity gets same placeholder."""
     detector = PIIDetector()
-    
+
     text = "手机号13812345678，请回拨13812345678"
     masked, matches = detector.mask(text)
-    
+
     # Should use same placeholder for same number
     masked_count = masked.count("<PHONE>")
     assert masked_count == 2
@@ -257,14 +256,14 @@ def test_consistent_entity_mapping():
 def test_no_placeholder_leak():
     """Test placeholders don't contain real content."""
     detector = PIIDetector()
-    
+
     test_cases = [
         ("手机13812345678", "<PHONE>"),
         ("邮箱test@example.com", "<EMAIL>"),
         ("身份证110101199001011234", "<ID_CARD>"),
     ]
-    
-    for text, expected_placeholder in test_cases:
+
+    for text, _expected_placeholder in test_cases:
         masked, _ = detector.mask(text)
         # Verify placeholder doesn't contain digits from original
         if "手机" in text:
@@ -279,11 +278,11 @@ def test_no_placeholder_leak():
 def test_fixed_phone_priority():
     """Test fixed phone is detected before mobile."""
     detector = PIIDetector()
-    
+
     # Fixed phone: 010-12345678
     text = "固定电话010-12345678"
     masked, matches = detector.mask(text)
-    
+
     assert any(m.pii_type == "phone_fixed" for m in matches)
     print("test_fixed_phone_priority: PASSED")
 
@@ -291,27 +290,27 @@ def test_fixed_phone_priority():
 if __name__ == "__main__":
     # Run tests
     print("Running PII detector tests...\n")
-    
+
     test_overlapping_phone_email()
     test_overlapping_id_phone()
     test_consistent_entity_mapping()
     test_no_placeholder_leak()
     test_fixed_phone_priority()
-    
+
     print("\nAll tests passed!")
-    
+
     # Demo
     print("\n" + "="*60)
     print("Demo:")
     print("="*60)
-    
+
     detector = PIIDetector()
     test_texts = [
         "我的手机号是13812345678，请发送到我的邮箱test@example.com",
         "订单号ORD1234567890，身份证号110101199001011234",
         "联系固定电话：010-12345678 或 021-87654321",
     ]
-    
+
     for text in test_texts:
         masked, matches = detector.mask(text)
         print(f"\nOriginal: {text}")

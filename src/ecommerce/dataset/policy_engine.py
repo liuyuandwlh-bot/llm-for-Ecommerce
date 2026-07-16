@@ -1,16 +1,24 @@
 """
 Policy Engine for E-commerce Customer Service
 
-Deterministic policy matching based on structured context.
+Round 2 rewrite:
+- Per-policy evaluation of (matched, conflict, missing) conditions
+- Explicit category_hint; no fallback to "return"
+- Conflict filtering before scoring
+- Tied-score returns ambiguous/escalate
+- Explicit behavior rules for non-policy intents (out-of-scope, tool-required,
+  injection, privacy) via match_behavior()
+- SlotSchema.from_dict strict by default; explicit aliases only
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any
 from enum import Enum
+from typing import Any
 
 
 class Decision(str, Enum):
     """Policy decision outcomes."""
+
     FULL_REFUND = "full_refund"
     EXCHANGE = "exchange"
     REPAIR = "repair"
@@ -19,7 +27,6 @@ class Decision(str, Enum):
     NEED_MORE_INFO = "need_more_info"
     ESCALATE = "escalate"
     PROVIDE_INFO = "provide_info"
-    COUPON_APPLICABLE = "coupon_applicable"
     COUPON_NOT_APPLICABLE = "coupon_not_applicable"
     REFUND_DIFFERENCE = "refund_difference"
     SHIP_WITHIN_48H = "ship_within_48h"
@@ -27,333 +34,522 @@ class Decision(str, Enum):
     RESEND_OR_REFUND = "resend_or_refund"
     ACKNOWLEDGE_APOLOGIZE = "acknowledge_apologize"
     ACCEPT_RETURN_REFUND = "accept_return_refund"
+    AMBIGUOUS = "ambiguous"
+
+
+# --- Behavior intents that should NOT fall through to the policy-engine default ---
+
+
+class BehaviorIntent(str, Enum):
+    """Non-policy intents routed through behavior rules."""
+
+    OUT_OF_SCOPE = "out_of_scope"
+    TOOL_REQUIRED = "tool_required"
+    PRIVACY = "privacy"
+    INJECTION = "injection"
+    ESCALATE = "escalate"
+
+
+# Mapping from canonical `intent` strings to a behavior dispatch.
+# If a case's intent is not policy-backed (return/exchange/logistics/coupon/
+# specification/complaint) and looks like one of the above, it dispatches here.
+_BEHAVIOR_INTENT_ALIASES: dict[str, BehaviorIntent] = {
+    BehaviorIntent.OUT_OF_SCOPE.value: BehaviorIntent.OUT_OF_SCOPE,
+    BehaviorIntent.TOOL_REQUIRED.value: BehaviorIntent.TOOL_REQUIRED,
+    BehaviorIntent.PRIVACY.value: BehaviorIntent.PRIVACY,
+    BehaviorIntent.INJECTION.value: BehaviorIntent.INJECTION,
+    BehaviorIntent.ESCALATE.value: BehaviorIntent.ESCALATE,
+}
 
 
 @dataclass
 class PolicyMatch:
-    """Result of policy matching."""
+    """Result of policy matching.
+
+    Attributes:
+        policy_id: Empty string when no full match was found.
+        decision: The decision enum.
+        missing_slots: Conditions that were missing to reach a full match.
+        conflicted_policies: Policies whose conditions conflicted with context.
+        candidate_policy_ids: All non-conflicting candidates considered.
+        ambiguity: True if multiple candidates tied for best score.
+        reasoning: Human-readable explanation.
+        requires_human: Whether this policy/behavior implies handoff.
+        escalation_reasons: Reasons for escalation.
+    """
+
     policy_id: str
     decision: Decision
     reasoning: str
+    requires_human: bool = False
+    missing_slots: list[str] = field(default_factory=list)
+    conflicted_policies: list[str] = field(default_factory=list)
+    candidate_policy_ids: list[str] = field(default_factory=list)
+    ambiguity: bool = False
+    escalation_reasons: list[str] = field(default_factory=list)
+
+
+@dataclass
+class BehaviorResult:
+    """Result of matching a non-policy intent through behavior rules."""
+
+    intent: str
+    decision: Decision
     requires_human: bool
-    missing_slots: List[str] = field(default_factory=list)
-    escalation_reasons: List[str] = field(default_factory=list)
+    reasoning: str
+    tool_expectation: str | None = None
+    escalation_reasons: list[str] = field(default_factory=list)
+
+
+# Canonical slot set for the 3C store domain. Aliased fields are explicit and
+# only accepted via `aliases` parameter.
+_CANONICAL_SLOT_FIELDS: set = {
+    # Order-related
+    "order_id",
+    "order_date",
+    "delivery_date",
+    "days_since_delivery",
+    "days_since_signed",
+    "days_since_order",
+    # Product
+    "product_name",
+    "product_category",
+    "product_model",
+    "product_variant",
+    # Package
+    "package_status",
+    "accessories_complete",
+    # Damage / quality
+    "user_damage",
+    "quality_issue",
+    "has_proof",
+    "misleading_confirmed",
+    # Exchange
+    "exchange_type",
+    "preferred_color",
+    # Logistics
+    "logistics_status",
+    "shipped",
+    "user_received",
+    "order_type",
+    # Coupon / pricing
+    "price_dropped",
+    "same_product",
+    "order_amount",
+    "coupon_code",
+    # Complaint
+    "complaint_type",
+    "user_emotion",
+    # Specification
+    "user_asked_compatibility",
+    "target_device",
+}
+
+
+_SLOT_ALIASES: dict[str, str] = {
+    "damage_by_user": "user_damage",  # legacy alias -> canonical
+    "preferred_size": "preferred_color",  # legacy 服装 size folded into 3C color
+    "size": "product_variant",  # 服装 size -> 3C variant
+}
 
 
 @dataclass
 class SlotSchema:
-    """Canonical slot definitions for 3C store."""
+    """Canonical slot definitions for 3C store.
+
+    Only the canonical fields are accepted in `from_dict`. Legacy aliases
+    are accepted only when `accept_aliases=True`.
+    """
+
     # Order-related
-    order_id: Optional[str] = None
-    order_date: Optional[str] = None
-    delivery_date: Optional[str] = None
-    days_since_delivery: Optional[int] = None
-    days_since_signed: Optional[int] = None
-    
+    order_id: str | None = None
+    order_date: str | None = None
+    delivery_date: str | None = None
+    days_since_delivery: int | None = None
+    days_since_signed: int | None = None
+    days_since_order: int | None = None
+
     # Product-related
-    product_name: Optional[str] = None
-    product_category: Optional[str] = None  # headphones, charger, cable, phone_case
-    
+    product_name: str | None = None
+    product_category: str | None = None  # headphones, charger, cable, phone_case
+    product_model: str | None = None  # e.g. specific phone case model
+    product_variant: str | None = None  # e.g. "iPhone 15 Pro Max" 3C variant
+
     # Package status
-    package_status: Optional[str] = None  # unopened, opened
-    accessories_complete: Optional[bool] = None
-    
+    package_status: str | None = None  # unopened, opened
+    accessories_complete: bool | None = None
+
     # Condition
-    user_damage: Optional[bool] = None  # NOTE: Use this consistently
-    # Legacy alias - will be normalized
-    damage_by_user: Optional[bool] = None
-    
+    user_damage: bool | None = None
+
     # Quality
-    quality_issue: Optional[bool] = None
-    has_proof: Optional[bool] = None
-    misleading_confirmed: Optional[bool] = None
-    
+    quality_issue: bool | None = None
+    has_proof: bool | None = None
+    misleading_confirmed: bool | None = None
+
     # Exchange
-    exchange_type: Optional[str] = None  # size, color
-    preferred_color: Optional[str] = None
-    preferred_size: Optional[str] = None
-    
+    exchange_type: str | None = None  # color, variant
+    preferred_color: str | None = None
+
     # Logistics
-    logistics_status: Optional[str] = None  # in_transit, delivered, signed, exception
-    shipped: Optional[bool] = None
-    user_received: Optional[bool] = None
-    order_type: Optional[str] = None  # in_stock, preorder
-    
-    # Coupon/Price
-    price_dropped: Optional[bool] = None
-    same_product: Optional[bool] = None
-    order_amount: Optional[float] = None
-    coupon_code: Optional[str] = None
-    
+    logistics_status: str | None = None  # in_transit, delivered, signed, exception
+    shipped: bool | None = None
+    user_received: bool | None = None
+    order_type: str | None = None  # in_stock, preorder
+
+    # Coupon / pricing
+    price_dropped: bool | None = None
+    same_product: bool | None = None
+    order_amount: float | None = None
+    coupon_code: str | None = None
+
     # Complaint
-    complaint_type: Optional[str] = None  # service_attitude, false_advertising
-    user_emotion: Optional[str] = None  # calm, angry, frustrated
-    
-    # Compatibility
-    user_asked_compatibility: Optional[bool] = None
-    target_device: Optional[str] = None
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dict, normalizing field names."""
-        result = {}
-        for key, value in self.__dict__.items():
-            if value is not None:
-                # Normalize damage_by_user -> user_damage
-                if key == "damage_by_user" and self.user_damage is None:
-                    result["user_damage"] = value
-                else:
-                    result[key] = value
-        return result
-    
+    complaint_type: str | None = None  # service_attitude, false_advertising
+    user_emotion: str | None = None  # calm, angry, frustrated
+
+    # Specification
+    user_asked_compatibility: bool | None = None
+    target_device: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dict, only including non-None fields."""
+        return {
+            key: value
+            for key, value in self.__dict__.items()
+            if value is not None
+        }
+
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "SlotSchema":
-        """Create from dict, handling legacy field names."""
-        # Normalize damage_by_user -> user_damage
-        if "damage_by_user" in data and "user_damage" not in data:
-            data = dict(data)
-            data["user_damage"] = data.pop("damage_by_user")
-        return cls(**{k: v for k, v in data.items() if k in cls.__annotations__})
+    def from_dict(
+        cls,
+        data: dict[str, Any],
+        accept_aliases: bool = True,
+    ) -> "SlotSchema":
+        """Create from dict, normalizing legacy aliases.
+
+        By default alias fields like `damage_by_user` are mapped to the
+        canonical `user_damage`. Unknown fields raise ValueError instead of
+        being silently dropped.
+        """
+        normalized: dict[str, Any] = {}
+        for key, value in data.items():
+            canonical = _SLOT_ALIASES.get(key, key)
+            if accept_aliases and key != canonical:
+                # Inherit only if not already set in input
+                canonical = canonical
+            if canonical not in _CANONICAL_SLOT_FIELDS:
+                raise ValueError(f"Unknown slot field: {key!r}")
+            # If both alias and canonical present, canonical wins
+            if canonical in normalized and key != canonical:
+                continue
+            normalized[canonical] = value
+
+        # Drop fields that are not annotated
+        annotated = {k: v for k, v in normalized.items() if k in cls.__annotations__}
+        return cls(**annotated)
+
+
+# --- Behavior rules ----------------------------------------------------------
+
+
+_BEHAVIOR_RULES: dict[BehaviorIntent, BehaviorResult] = {
+    BehaviorIntent.OUT_OF_SCOPE: BehaviorResult(
+        intent=BehaviorIntent.OUT_OF_SCOPE.value,
+        decision=Decision.NEED_MORE_INFO,
+        requires_human=False,
+        reasoning="该问题超出当前3C店铺客服范围",
+        tool_expectation=None,
+    ),
+    BehaviorIntent.TOOL_REQUIRED: BehaviorResult(
+        intent=BehaviorIntent.TOOL_REQUIRED.value,
+        decision=Decision.NEED_MORE_INFO,
+        requires_human=False,
+        reasoning="需要工具调用查询实时订单/物流信息",
+        tool_expectation="query_logistics_or_order",
+    ),
+    BehaviorIntent.PRIVACY: BehaviorResult(
+        intent=BehaviorIntent.PRIVACY.value,
+        decision=Decision.ESCALATE,
+        requires_human=True,
+        reasoning="用户提供了PII/敏感信息，需要安全处理转人工",
+        tool_expectation=None,
+    ),
+    BehaviorIntent.INJECTION: BehaviorResult(
+        intent=BehaviorIntent.INJECTION.value,
+        decision=Decision.REJECT,
+        requires_human=False,
+        reasoning="检测到提示注入尝试，已拒答",
+        tool_expectation=None,
+    ),
+    BehaviorIntent.ESCALATE: BehaviorResult(
+        intent=BehaviorIntent.ESCALATE.value,
+        decision=Decision.ESCALATE,
+        requires_human=True,
+        reasoning="用户明确要求升级或人工处理",
+        tool_expectation=None,
+    ),
+}
 
 
 class PolicyEngine:
+    """Deterministic policy matching engine.
+
+    The engine maintains per-policy scoring across the full candidate pool and
+    only filters out policies whose conditions actively conflict with the
+    caller-provided context. A "missing slot" is only meaningful relative to a
+    specific policy, so missing_slots is computed against the best partial
+    candidate rather than as a global fallback.
     """
-    Deterministic policy matching engine.
-    
-    Takes structured context as input and returns matching policy decision.
-    """
-    
-    def __init__(self, policies: List[Dict[str, Any]]):
-        """
-        Initialize with policy list.
-        
-        Args:
-            policies: List of policy dictionaries with conditions and decisions
-        """
+
+    def __init__(self, policies: list[dict[str, Any]]):
         self.policies = policies
+        self._validate_policies()
         self._build_index()
-    
-    def _build_index(self):
-        """Build internal index for efficient matching."""
-        # Index by category for faster lookup
-        self.policies_by_category: Dict[str, List[Dict]] = {}
+
+    # ----- Indexing ---------------------------------------------------------
+
+    def _validate_policies(self) -> None:
+        """Ensure policy IDs and decision enums are well-formed."""
+        seen: set = set()
+        for p in self.policies:
+            pid = p.get("policy_id")
+            if not pid:
+                raise ValueError("policy without policy_id")
+            if pid in seen:
+                raise ValueError(f"duplicate policy_id: {pid}")
+            seen.add(pid)
+            for d in p.get("decisions", []):
+                decision = d.get("decision")
+                if decision not in Decision._value2member_map_:
+                    raise ValueError(
+                        f"policy {pid} has unknown decision: {decision}"
+                    )
+
+    def _build_index(self) -> None:
+        """Index policies by category for faster lookup."""
+        self._by_category: dict[str, list[dict[str, Any]]] = {}
         for policy in self.policies:
-            cat = policy.get("category", "unknown")
-            if cat not in self.policies_by_category:
-                self.policies_by_category[cat] = []
-            self.policies_by_category[cat].append(policy)
-    
+            category = policy.get("category", "unknown")
+            self._by_category.setdefault(category, []).append(policy)
+
+    # ----- Public API -------------------------------------------------------
+
+    def list_categories(self) -> list[str]:
+        """Return all known policy categories."""
+        return list(self._by_category.keys())
+
     def match(
-        self, 
-        context: Dict[str, Any],
-        category_hint: Optional[str] = None
+        self,
+        context: dict[str, Any],
+        category_hint: str | None = None,
+        accept_aliases: bool = True,
     ) -> PolicyMatch:
-        """
-        Match context against policies.
-        
+        """Match a structured context against policies.
+
         Args:
-            context: Structured context with slot values
-            category_hint: Optional category to narrow search
-            
+            context: Structured slot map (raw dict, may include aliases if
+                ``accept_aliases`` is True).
+            category_hint: Restrict candidates to a specific category. When
+                omitted, all policies are evaluated.
+            accept_aliases: Passed through to ``SlotSchema.from_dict``.
+
         Returns:
-            PolicyMatch with decision and reasoning
+            A ``PolicyMatch``. ``policy_id`` is empty when no policy fully
+            matches; ``ambiguity`` is set when several candidates tie.
         """
-        # Normalize context
-        slots = SlotSchema.from_dict(context)
+        try:
+            slots = SlotSchema.from_dict(context, accept_aliases=accept_aliases)
+        except ValueError as e:
+            return PolicyMatch(
+                policy_id="",
+                decision=Decision.ESCALATE,
+                reasoning=f"Invalid context: {e}",
+                requires_human=True,
+                escalation_reasons=["unrecognized_slot"],
+            )
+
         slot_dict = slots.to_dict()
-        
-        # Determine category from context if not provided
-        if category_hint is None:
-            category_hint = self._infer_category(slot_dict)
-        
-        # Get policies for category
-        policies_to_check = self.policies_by_category.get(
-            category_hint, 
-            self.policies
+
+        candidates = self.policies
+        if category_hint is not None:
+            candidates = self._by_category.get(category_hint, [])
+            if not candidates:
+                return PolicyMatch(
+                    policy_id="",
+                    decision=Decision.ESCALATE,
+                    reasoning=f"unknown category: {category_hint}",
+                    requires_human=True,
+                )
+
+        evaluations: list[tuple[dict, dict, set, list[str], list[str]]] = []
+        for policy in candidates:
+            evaluation = self._evaluate_policy(policy, slot_dict)
+            evaluations.append(evaluation)
+
+        # A "matchable" policy is one without known conflicts. Conflicts mean
+        # the caller's context actively contradicts the policy, so even when
+        # nothing is "missing" we should not consider it a full match.
+        matchable = [e for e in evaluations if not e["conflicts"]]
+        full_matches = [e for e in matchable if e["missing"] == []]
+
+        if len(full_matches) == 1:
+            policy = full_matches[0]["policy"]
+            decision = policy["decisions"][0]
+            return PolicyMatch(
+                policy_id=policy["policy_id"],
+                decision=Decision(decision["decision"]),
+                reasoning=decision.get("reasoning", ""),
+                requires_human=decision.get("requires_human", False),
+                candidate_policy_ids=[e["policy"]["policy_id"] for e in full_matches],
+                escalation_reasons=decision.get("escalation_reasons", []),
+            )
+
+        if len(full_matches) > 1:
+            # Tied full match -> ambiguous, escalate
+            policy_ids = [e["policy"]["policy_id"] for e in full_matches]
+            return PolicyMatch(
+                policy_id="",
+                decision=Decision.AMBIGUOUS,
+                reasoning=f"Multiple full matches: {policy_ids}",
+                requires_human=True,
+                candidate_policy_ids=policy_ids,
+                ambiguity=True,
+                escalation_reasons=["ambiguous_full_match"],
+            )
+
+        # No full matches. Look for the strongest partial match among
+        # matchable policies (no active conflicts).
+        any_partial = matchable
+        any_partial.sort(
+            key=lambda e: (
+                -len(e["matched_fields"]),
+                len(e["missing"]),
+                -e["priority"],
+                e["policy"]["policy_id"],  # tie-break with policy id
+            )
         )
-        
-        # Check each policy
-        for policy in policies_to_check:
-            match_result = self._check_policy(policy, slot_dict)
-            if match_result is not None:
-                return match_result
-        
-        # No match found - return need_more_info or escalate
-        return self._no_match_response(slot_dict)
-    
-    def _infer_category(self, context: Dict[str, Any]) -> str:
-        """Infer policy category from context."""
-        # Check for specific slots that indicate category
-        if context.get("days_since_delivery") is not None:
-            if context.get("quality_issue"):
-                return "return"
-            if context.get("exchange_type") is not None:
-                return "exchange"
-            return "return"
-        
-        if context.get("logistics_status") is not None or context.get("shipped") is not None:
-            return "logistics"
-        
-        if context.get("price_dropped") is not None or context.get("coupon_code") is not None:
-            return "coupon"
-        
-        if context.get("complaint_type") is not None or context.get("user_emotion") is not None:
-            return "complaint"
-        
-        if context.get("user_asked_compatibility") is not None:
-            return "specification"
-        
-        # Default to return for delivery-related queries
-        if context.get("order_id") is not None:
-            return "return"
-        
-        return "return"  # default
-    
-    def _check_policy(
-        self, 
-        policy: Dict[str, Any], 
-        context: Dict[str, Any]
-    ) -> Optional[PolicyMatch]:
+        if any_partial and any_partial[0]["matched_fields"]:
+            best = any_partial[0]
+            return PolicyMatch(
+                policy_id="",
+                decision=Decision.NEED_MORE_INFO,
+                reasoning="no policy fully matched",
+                requires_human=False,
+                missing_slots=list(best["missing"]),
+                candidate_policy_ids=[],
+                escalation_reasons=[],
+            )
+
+        # Nothing matched at all
+        return PolicyMatch(
+            policy_id="",
+            decision=Decision.ESCALATE,
+            reasoning="no compatible policy",
+            requires_human=True,
+            conflicted_policies=self._collect_conflicts(evaluations),
+        )
+
+    def match_behavior(self, intent: str) -> BehaviorResult:
+        """Resolve a non-policy intent via explicit behavior rules.
+
+        Unknown behavior intents fall back to ``out_of_scope``.
         """
-        Check if context matches a policy's conditions.
-        
-        Returns PolicyMatch if matched, None otherwise.
+        key = _BEHAVIOR_INTENT_ALIASES.get(intent, BehaviorIntent.OUT_OF_SCOPE)
+        return _BEHAVIOR_RULES[key]
+
+    # ----- Internals --------------------------------------------------------
+
+    @staticmethod
+    def _evaluate_policy(
+        policy: dict[str, Any],
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Evaluate a policy against a context dict.
+
+        Returns a dict with:
+            policy: original policy
+            matched_fields: set of condition field names whose comparison succeeded
+            matched: count of matched fields
+            missing: list of fields that were absent
+            conflicts: list of fields whose comparison failed (present but mismatched)
+            priority: -len(missing) so policies with fewer missing slots break ties
         """
         conditions = policy.get("conditions", [])
-        
-        # Track missing slots
-        missing_slots = []
-        all_match = True
-        
+        matched_fields: set = set()
+        missing: list[str] = []
+        conflicts: list[str] = []
+
         for cond in conditions:
             field = cond.get("field")
             operator = cond.get("operator")
             expected = cond.get("value")
-            
-            # Check if slot exists
+
             actual = context.get(field)
             if actual is None:
-                missing_slots.append(field)
-                all_match = False
+                missing.append(field)
                 continue
-            
-            # Check condition
-            if not self._evaluate_condition(actual, operator, expected):
-                all_match = False
-                break
-        
-        if not all_match:
-            return None
-        
-        # Check if decision requires human
-        decisions = policy.get("decisions", [])
-        if not decisions:
-            return None
-        
-        decision = decisions[0]
-        
-        return PolicyMatch(
-            policy_id=policy.get("policy_id", ""),
-            decision=Decision(decision.get("decision", "need_more_info")),
-            reasoning=decision.get("reasoning", ""),
-            requires_human=decision.get("requires_human", False),
-            missing_slots=missing_slots,
-            escalation_reasons=decision.get("escalation_reasons", []),
-        )
-    
-    def _evaluate_condition(
-        self, 
-        actual: Any, 
-        operator: str, 
-        expected: Any
-    ) -> bool:
+            if PolicyEngine._evaluate_condition(actual, operator, expected):
+                matched_fields.add(field)
+            else:
+                conflicts.append(field)
+
+        priority = policy.get("priority", 0)
+        return {
+            "policy": policy,
+            "matched_fields": matched_fields,
+            "matched": len(matched_fields),
+            "missing": missing,
+            "conflicts": conflicts,
+            "priority": priority,
+        }
+
+    @staticmethod
+    def _evaluate_condition(actual: Any, operator: str, expected: Any) -> bool:
         """Evaluate a single condition."""
         if operator == "eq":
             return actual == expected
-        elif operator == "ne":
+        if operator == "ne":
             return actual != expected
-        elif operator == "gt":
+        if operator == "gt":
             return actual > expected
-        elif operator == "lt":
+        if operator == "lt":
             return actual < expected
-        elif operator == "gte":
+        if operator == "gte":
             return actual >= expected
-        elif operator == "lte":
+        if operator == "lte":
             return actual <= expected
-        elif operator == "in":
+        if operator == "in":
             return actual in expected
-        elif operator == "not_in":
+        if operator == "not_in":
             return actual not in expected
         return False
-    
-    def _no_match_response(self, context: Dict[str, Any]) -> PolicyMatch:
-        """Generate response when no policy matches."""
-        # Check if we have minimum required info
-        has_order_info = context.get("order_id") is not None
-        has_product_info = context.get("product_name") is not None
-        
-        if not has_order_info or not has_product_info:
-            missing = []
-            if not has_order_info:
-                missing.append("order_id")
-            if not has_product_info:
-                missing.append("product_name")
-            
-            return PolicyMatch(
-                policy_id="",
-                decision=Decision.NEED_MORE_INFO,
-                reasoning="需要更多信息才能处理您的请求",
-                requires_human=False,
-                missing_slots=missing,
-            )
-        
-        # Unclear case - escalate
-        return PolicyMatch(
-            policy_id="",
-            decision=Decision.ESCALATE,
-            reasoning="您的问题需要人工客服处理",
-            requires_human=True,
-            escalation_reasons=["无法匹配现有政策"],
-        )
+
+    @staticmethod
+    def _collect_conflicts(evaluations: list[dict]) -> list[str]:
+        conflicted: list[str] = []
+        seen: set = set()
+        for e in evaluations:
+            if e["conflicts"]:
+                pid = e["policy"]["policy_id"]
+                if pid not in seen:
+                    conflicted.append(pid)
+                    seen.add(pid)
+        return conflicted
 
 
-def validate_policy_references(
-    policies: List[Dict],
-    cases: List[Dict]
-) -> List[str]:
-    """
-    Validate that all case policy references exist in policies.
-    
-    Returns list of error messages.
-    """
-    errors = []
-    policy_ids = {p["policy_id"] for p in policies}
-    
-    for case in cases:
-        case_id = case.get("case_id", "unknown")
-        expected_policies = case.get("expected_policy_ids", [])
-        
-        for policy_id in expected_policies:
-            if policy_id and policy_id not in policy_ids:
-                errors.append(
-                    f"Case {case_id}: referenced policy {policy_id} not found"
-                )
-    
-    return errors
+# Module-level validators ---------------------------------------------------
 
 
-def validate_policy_uniqueness(policies: List[Dict]) -> List[str]:
-    """
-    Validate that policy IDs are unique.
-    
-    Returns list of error messages.
-    """
-    errors = []
-    seen_ids = set()
-    
+def validate_policy_uniqueness(policies: list[dict]) -> list[str]:
+    """Return list of human-readable errors for duplicate policy IDs."""
+    errors: list[str] = []
+    seen: set = set()
     for policy in policies:
-        policy_id = policy.get("policy_id")
-        if policy_id in seen_ids:
-            errors.append(f"Duplicate policy_id: {policy_id}")
-        seen_ids.add(policy_id)
-    
+        pid = policy.get("policy_id")
+        if not pid:
+            errors.append("policy without policy_id")
+            continue
+        if pid in seen:
+            errors.append(f"duplicate policy_id: {pid}")
+        seen.add(pid)
     return errors
