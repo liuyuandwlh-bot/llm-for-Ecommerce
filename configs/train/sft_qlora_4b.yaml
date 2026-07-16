@@ -1,0 +1,61 @@
+# Training Configuration for QLoRA SFT
+
+# Model Configuration
+model:
+  name: "Qwen/Qwen3-4B-Instruct-2507"
+  revision: "cdbee75f17c01a7cc42f958dc650907174af0554"
+  trust_remote_code: true
+
+# Quantization (QLoRA)
+quantization:
+  enabled: true
+  load_in_4bit: true
+  bnb_4bit_compute_dtype: "bfloat16"
+  bnb_4bit_quant_type: "nf4"
+  bnb_4bit_use_double_quant: true
+
+# LoRA Configuration
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: "all-linear"
+  bias: "none"
+
+# Training Configuration
+training:
+  num_train_epochs: 2
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 8
+  learning_rate: 2.0e-4
+  warmup_ratio: 0.05
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  max_seq_length: 1536
+  packing: false
+
+# Evaluation
+evaluation:
+  eval_strategy: "steps"
+  eval_steps: 100
+  save_strategy: "steps"
+  save_steps: 100
+  save_total_limit: 3
+  load_best_model_at_end: true
+
+# Output
+output:
+  dir: "output/sft_qlora_qwen3_4b"
+  run_name: "sft_qlora_4b"
+
+# Hardware
+hardware:
+  gradient_checkpointing: true
+  bf16: true
+  seed: 42
+
+# Data
+data:
+  train_path: "data/processed/synthetic_conversations.jsonl"
+  eval_path: "data/splits/eval.jsonl"
+  max_samples: null

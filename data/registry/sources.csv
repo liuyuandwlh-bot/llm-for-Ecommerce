@@ -1,0 +1,2 @@
+source_id,source_name,source_url,publisher,acquired_at,published_at,license,allowed_train,allowed_evaluate,allowed_local_demo,allowed_redistribute,contains_pii,checksum_sha256,version,notes
+# Add new entries below this line

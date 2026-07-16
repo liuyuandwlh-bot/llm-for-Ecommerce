@@ -1,0 +1,48 @@
+# vLLM Serving Configuration
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  worker_timeout: 300
+  max_concurrent_requests: 32
+
+model:
+  name: "Qwen/Qwen3-4B-Instruct-2507"
+  revision: "cdbee75f17c01a7cc42f958dc650907174af0554"
+  trust_remote_code: true
+
+# GPU Configuration
+gpu:
+  memory_utilization: 0.85
+  tensor_parallel_size: 1  # Change for multi-GPU
+
+# Model Limits
+model_limits:
+  max_model_len: 4096
+  max_num_seqs: 256
+  max_num_batched_tokens: 8192
+
+# LoRA Configuration
+lora:
+  enabled: true
+  modules:
+    ecom: "./output/sft_qlora/checkpoint-xxx"
+
+# Quantization
+quantization:
+  enabled: false
+  # type: "awq"  # awq, gptq, fp8
+
+# Caching
+cache:
+  gpu_memory_utilization: 0.9
+
+# Logging
+logging:
+  level: "INFO"
+  format: "structured"
+
+# OpenAI Compatible API
+openai_api:
+  enabled: true
+  api_prefix: "/v1"

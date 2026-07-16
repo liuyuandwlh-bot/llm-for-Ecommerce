@@ -1,0 +1,57 @@
+# RAG Configuration
+
+# Document Processing
+document:
+  input_dir: "data/raw/reports"
+  output_dir: "data/interim/parsed"
+  parser_type: "pdfplumber"  # pdfplumber, pymupdf, docling
+
+# Chunking
+chunking:
+  chunk_size: 512  # tokens
+  chunk_overlap: 0.15  # 15%
+  min_chunk_size: 50
+  max_chunk_size: 1024
+  table_as_chunk: true
+  parent_chunk_size: 2048
+
+# Embedding Models
+embedding:
+  dense_model: "BAAI/bge-m3"  # or "Qwen/Qwen3-Embedding-0.6B"
+  revision: "5617a9f"
+  batch_size: 32
+  max_length: 512
+
+# Retrieval
+retrieval:
+  bm25_top_k: 50
+  dense_top_k: 50
+  rrf_k: 60
+  final_top_k: 10
+
+# Reranker
+reranker:
+  enabled: true
+  model: "BAAI/bge-reranker-v2-m3"  # or "Qwen/Qwen3-Reranker-0.6B"
+  revision: "953dc6f"
+  top_k: 5
+  batch_size: 32
+
+# Vector Index
+vector_index:
+  type: "flat"  # flat, hnsw
+  metric: "cosine"  # cosine, ip, l2
+  hnsw_m: 16  # for HNSW
+  hnsw_ef_construction: 200  # for HNSW
+
+# Generation
+generation:
+  model: "Qwen/Qwen3-4B-Instruct-2507"
+  max_tokens: 512
+  temperature: 0.7
+  top_p: 0.9
+
+# Output
+output:
+  chunks_path: "data/processed/chunks.jsonl"
+  index_path: "data/interim/faiss_index"
