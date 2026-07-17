@@ -99,7 +99,9 @@ class FakeEmbeddingBackend(EmbeddingBackend):
 
 
 class RealEmbeddingBackend(EmbeddingBackend):  # pragma: no cover - requires model
-    def __init__(self, model_name: str = "BAAI/bge-m3", device: str = "auto", revision: str | None = None):
+    def __init__(
+        self, model_name: str = "BAAI/bge-m3", device: str = "auto", revision: str | None = None
+    ):
         self.model_name = model_name
         self.device = device
         self.revision = revision
@@ -109,6 +111,7 @@ class RealEmbeddingBackend(EmbeddingBackend):  # pragma: no cover - requires mod
     def _load(self):
         if self._model is None:
             from sentence_transformers import SentenceTransformer
+
             kwargs = {}
             if self.revision:
                 kwargs["revision"] = self.revision
@@ -346,10 +349,10 @@ class HybridRetriever:
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
 
-        # Chunk order is the order in self.chunks (which equals dense order).
+        # Chunk order: save only string IDs (not full dicts).
         chunk_order_path = out / "chunk_order.json"
         with open(chunk_order_path, "w", encoding="utf-8") as f:
-            json.dump({"chunk_ids": self.chunks}, f, ensure_ascii=False)
+            json.dump({"chunk_ids": [c["chunk_id"] for c in self.chunks]}, f, ensure_ascii=False)
 
         # Chunk map (full bodies)
         chunk_map_path = out / "chunk_map.json"
@@ -391,6 +394,10 @@ class HybridRetriever:
             self.parents = json.load(f)
 
         self.chunks = chunk_order["chunk_ids"]
+        if not all(isinstance(cid, str) for cid in self.chunks):
+            raise ValueError(
+                f"chunk_ids must be strings, got {[type(c).__name__ for c in self.chunks[:3]]}"
+            )
         # Reconstruct dense chunks list in row order
         dense_chunks = [self.chunk_map[cid] for cid in self.chunks]
         # Rebuild sparse and dense
@@ -420,6 +427,7 @@ def _make_backend(backend_name: str) -> EmbeddingBackend:
 
 def main() -> int:
     import argparse
+
     parser = argparse.ArgumentParser(description="Build/load a hybrid retriever.")
     parser.add_argument("--chunks", required=True, help="Path to chunks JSONL")
     parser.add_argument("--output", required=True, help="Index directory")
@@ -437,9 +445,19 @@ def main() -> int:
             chunks.append(json.loads(line))
 
     # Split children vs parents
-    children = [c for c in chunks if c.get("chunk_type") != "mixed" or not c.get("metadata", {}).get("child_ids")]
+    children = [
+        c
+        for c in chunks
+        if c.get("chunk_type") != "mixed" or not c.get("metadata", {}).get("child_ids")
+    ]
     # Heuristic: parents are mixed with child_ids or are table parents
-    parents = [c for c in chunks if c.get("chunk_type") == "mixed" or c.get("chunk_type") == "table" and c.get("metadata", {}).get("source", "").startswith("parent")]
+    parents = [
+        c
+        for c in chunks
+        if c.get("chunk_type") == "mixed"
+        or c.get("chunk_type") == "table"
+        and c.get("metadata", {}).get("source", "").startswith("parent")
+    ]
 
     if not children:
         raise SystemExit("no chunks available for indexing")

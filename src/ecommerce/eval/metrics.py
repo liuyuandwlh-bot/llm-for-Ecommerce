@@ -88,24 +88,52 @@ def _prf(tp: int, fp: int, fn: int) -> dict[str, float]:
     return {"precision": precision, "recall": recall, "f1": f1, "support": tp + fn}
 
 
+PARSE_FAILURE_SENTINEL = "__PARSE_FAILURE__"
+
+
+def _normalize_for_sort(value: Any) -> str:
+    """Coerce None → sentinel so it can be sorted alongside strings."""
+    if value is None:
+        return PARSE_FAILURE_SENTINEL
+    return str(value)
+
+
 def f1_metrics(preds: Sequence[Any], refs: Sequence[Any]) -> dict[str, float]:
-    """Macro/micro F1 over a flat list of values."""
+    """Macro/micro F1 over a flat list of values.
+
+    None values (parse failures) are normalized to a string sentinel so they
+    can coexist in the same sorted label set without a TypeError.
+    """
     assert len(preds) == len(refs)
-    labels = sorted({*preds, *refs})
+    normalized_preds = [_normalize_for_sort(p) for p in preds]
+    normalized_refs = [_normalize_for_sort(r) for r in refs]
+    labels = sorted({*normalized_preds, *normalized_refs})
     if not labels:
         return {"accuracy": 0.0, "macro_f1": 0.0, "micro_f1": 0.0, "per_class": {}}
 
     per_class: dict[str, dict[str, float]] = {}
     tp_total = fp_total = fn_total = correct = 0
     for label in labels:
-        tp = sum(1 for p, r in zip(preds, refs, strict=False) if p == label and r == label)
-        fp = sum(1 for p, r in zip(preds, refs, strict=False) if p == label and r != label)
-        fn = sum(1 for p, r in zip(preds, refs, strict=False) if r == label and p != label)
+        tp = sum(
+            1 for p, r in zip(normalized_preds, normalized_refs, strict=False)
+            if p == label and r == label
+        )
+        fp = sum(
+            1 for p, r in zip(normalized_preds, normalized_refs, strict=False)
+            if p == label and r != label
+        )
+        fn = sum(
+            1 for p, r in zip(normalized_preds, normalized_refs, strict=False)
+            if r == label and p != label
+        )
         per_class[label] = _prf(tp, fp, fn)
         tp_total += tp
         fp_total += fp
         fn_total += fn
-    correct = sum(1 for p, r in zip(preds, refs, strict=False) if p == r)
+    correct = sum(
+        1 for p, r in zip(normalized_preds, normalized_refs, strict=False)
+        if p == r
+    )
 
     micro = _prf(tp_total, fp_total, fn_total)
     macro = sum(v["f1"] for v in per_class.values()) / len(per_class)
@@ -144,9 +172,15 @@ def slot_f1_metrics(
     tp_total = fp_total = fn_total = 0
     for cls in classes:
         key, value = cls
-        tp = sum(1 for p, r in pairs if str(p.get(key, "")) == value and str(r.get(key, "")) == value)
-        fp = sum(1 for p, r in pairs if str(p.get(key, "")) == value and str(r.get(key, "")) != value)
-        fn = sum(1 for p, r in pairs if str(r.get(key, "")) == value and str(p.get(key, "")) != value)
+        tp = sum(
+            1 for p, r in pairs if str(p.get(key, "")) == value and str(r.get(key, "")) == value
+        )
+        fp = sum(
+            1 for p, r in pairs if str(p.get(key, "")) == value and str(r.get(key, "")) != value
+        )
+        fn = sum(
+            1 for p, r in pairs if str(r.get(key, "")) == value and str(p.get(key, "")) != value
+        )
         per_class[cls] = _prf(tp, fp, fn)
         tp_total += tp
         fp_total += fp
@@ -201,7 +235,11 @@ def missing_slot_metrics(
     micro = _prf(tp_total, fp_total, fn_total)
     macro = sum(v["f1"] for v in per_class.values()) / len(per_class)
     exact = sum(1 for p, r in zip(pred_bin, ref_bin, strict=False) if p == r)
-    return {"macro_f1": macro, "micro_f1": micro["f1"], "exact_match": _safe_div(exact, len(pred_bin))}
+    return {
+        "macro_f1": macro,
+        "micro_f1": micro["f1"],
+        "exact_match": _safe_div(exact, len(pred_bin)),
+    }
 
 
 def handoff_accuracy(pred: Sequence[bool], ref: Sequence[bool]) -> float:
@@ -285,11 +323,12 @@ def check_pii_leak(text: str) -> bool:
     if not text:
         return False
     import re
+
     patterns = (
-        r"1[3-9]\d{9}",                       # phone
-        r"\d{17}[\dXx]",                       # CN ID 18-digit
-        r"\b\d{15}\b",                         # older CN ID 15-digit (digits only)
-        r"[\w.+-]+@[\w-]+\.[\w.-]+",          # email
+        r"1[3-9]\d{9}",  # phone
+        r"\d{17}[\dXx]",  # CN ID 18-digit
+        r"\b\d{15}\b",  # older CN ID 15-digit (digits only)
+        r"[\w.+-]+@[\w-]+\.[\w.-]+",  # email
     )
     return any(re.search(p, text) for p in patterns)
 
@@ -412,7 +451,11 @@ def build_reference_fixture() -> dict[str, Any]:
             "sample_id": "s1",
             "parsed": Prediction(
                 intent="return_query",
-                slots={"days_since_delivery": 5, "package_status": "unopened", "user_damage": False},
+                slots={
+                    "days_since_delivery": 5,
+                    "package_status": "unopened",
+                    "user_damage": False,
+                },
                 policy_ids=["return_001"],
                 decision="full_refund",
                 missing_slots=[],
@@ -422,7 +465,11 @@ def build_reference_fixture() -> dict[str, Any]:
             ).__dict__,
             "reference": {
                 "intent": "return_query",
-                "slots": {"days_since_delivery": 5, "package_status": "unopened", "user_damage": False},
+                "slots": {
+                    "days_since_delivery": 5,
+                    "package_status": "unopened",
+                    "user_damage": False,
+                },
                 "policy_ids": ["return_001"],
                 "decision": "full_refund",
                 "expected_missing_slots": [],
@@ -434,7 +481,11 @@ def build_reference_fixture() -> dict[str, Any]:
             "sample_id": "s2",
             "parsed": Prediction(
                 intent="return_query",
-                slots={"days_since_delivery": 5, "package_status": "unopened", "user_damage": False},
+                slots={
+                    "days_since_delivery": 5,
+                    "package_status": "unopened",
+                    "user_damage": False,
+                },
                 policy_ids=["return_001"],
                 decision="exchange",
                 missing_slots=[],
@@ -444,7 +495,11 @@ def build_reference_fixture() -> dict[str, Any]:
             ).__dict__,
             "reference": {
                 "intent": "return_query",
-                "slots": {"days_since_delivery": 5, "package_status": "unopened", "user_damage": False},
+                "slots": {
+                    "days_since_delivery": 5,
+                    "package_status": "unopened",
+                    "user_damage": False,
+                },
                 "policy_ids": ["return_001"],
                 "decision": "full_refund",
                 "expected_missing_slots": [],

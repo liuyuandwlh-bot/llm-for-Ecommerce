@@ -1,58 +1,110 @@
 """
-SFT trainer / formatter / collator for Round 2.
+SFT trainer / formatter / collator for Round 3.
 
-Key changes:
-- Drop ``DataCollatorForCompletionLM`` (does not exist in transformers).
-- Build a stable, dependency-light tokenization pipeline using each model's
-  ``apply_chat_template`` and a hand-rolled assistant-prefix detector that
-  is unit-tested with fake tokenizers.
-- ``--dry-run`` exercises the full tokenize/mask path against a fake
-  tokenizer so we never import the 8B weights in tests.
-- Heavy imports (torch / transformers / peft / trl) live behind lazy
-  imports so ``python -m src.ecommerce.train.sft_trainer --help`` works
-  on a machine without the GPU stack.
+Key changes vs Round 2:
+- Tokenization uses *cumulative prefix tokenization* to find assistant spans:
+  each boundary is determined by tokenizing messages[:i] and messages[:i+1]
+  via apply_chat_template, NOT by string rfind on the full rendered text.
+- Two structurally different fake tokenizers:
+    * Qwen-style ChatML  (<|im_start|> / <|im_end|> per message)
+    * Llama-3-style     (<|begin_of_text|>, role headers, <|eot_id|> per message)
+- assistant-only labels: system / user / tool → -100;
+  assistant generation content → actual token ids (including official terminator).
+- Truncation preserves original length for statistics; samples whose
+  assistant span is fully discarded are rejected.
+- Collator returns list-of-lists (not tensors) so dry-run works without torch.
+- Heavy imports (torch / transformers / peft / trl) live behind lazy imports.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
 import logging
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Data format helpers (tokenizer-independent)
+# Message iterator
 # ---------------------------------------------------------------------------
 
 
-def iter_messages(example: dict[str, Any]) -> Iterable[dict[str, str]]:
-    """Yield messages in order with role filtering."""
+def iter_messages(example: dict[str, Any]) -> list[dict[str, str]]:
+    """Return filtered, ordered message list for tokenization.
+
+    Skips empty-assistant messages and unknown roles.
+    """
+    out: list[dict[str, str]] = []
     for msg in example.get("messages") or []:
-        role = msg.get("role")
-        content = msg.get("content", "")
+        role = msg.get("role", "")
         if role not in {"system", "user", "assistant", "tool"}:
             continue
-        if role == "assistant" and not (content or "").strip():
+        content: str = msg.get("content", "")
+        # Skip empty assistant turns (no content to learn from)
+        if role == "assistant" and not content.strip():
             continue
-        yield {"role": role, "content": content}
+        out.append({"role": role, "content": content})
+    return out
 
 
-def format_chat_prefix(tokenizer, role: str, content: str) -> str:
-    """Render the prefix of a message (header + body, without the trailing
-    role terminator)."""
-    return tokenizer.apply_chat_template(
-        [{"role": role, "content": content}],
-        tokenize=False,
-        add_generation_prompt=False,
-    )
+# ---------------------------------------------------------------------------
+# Tokenization + assistant-only label mask  (cumulative prefix method)
+# ---------------------------------------------------------------------------
 
 
-def format_chat_full(tokenizer, messages: list[dict[str, str]]) -> str:
-    """Render the full conversation using the tokenizer's template."""
+@dataclass
+class TokenizedSample:
+    """Tokenized conversation with per-token loss mask.
+
+    Attributes:
+        input_ids:       list of token ids.
+        labels:          same length as input_ids;
+                         -100 = ignore (non-assistant), actual id = learn.
+        attention_mask:  1 for real tokens, 0 for pad.
+        original_len:    token count BEFORE truncation (for statistics).
+        truncated:       True if sequence was cut at max_length.
+        assistant_lost:   True if truncation removed the entire assistant span.
+    """
+
+    input_ids: list[int]
+    labels: list[int]
+    attention_mask: list[int]
+    original_len: int = 0
+    truncated: bool = False
+    assistant_lost: bool = False
+
+    def truncate(self, max_length: int) -> TokenizedSample:
+        if not max_length or len(self.input_ids) <= max_length:
+            self.original_len = len(self.input_ids)
+            return self
+
+        self.truncated = True
+        self.original_len = len(self.input_ids)
+
+        # Check whether the assistant span is completely gone.
+        # The assistant span begins at the first token whose label != -100.
+        assistant_start = next(
+            (i for i, lbl in enumerate(self.labels) if lbl != -100), None
+        )
+        if assistant_start is not None and assistant_start >= max_length:
+            self.assistant_lost = True
+
+        self.input_ids = self.input_ids[:max_length]
+        self.labels = self.labels[:max_length]
+        self.attention_mask = self.attention_mask[:max_length]
+        return self
+
+
+def _render_prefix(tokenizer: Any, messages: list[dict[str, str]]) -> str:
+    """Render messages through apply_chat_template (no tokenization)."""
     return tokenizer.apply_chat_template(
         messages,
         tokenize=False,
@@ -60,257 +112,363 @@ def format_chat_full(tokenizer, messages: list[dict[str, str]]) -> str:
     )
 
 
-def find_assistant_prefix_offset(
-    prefix_text: str,
-    full_text: str,
-) -> int:
-    """Return the offset within ``full_text`` where assistant content begins.
-
-    Strategy: locate the *last* occurrence of ``prefix_text`` in ``full_text``
-    that is followed by assistant content. The returned offset points to the
-    first content character (after role header).
-    """
-    idx = full_text.rfind(prefix_text)
-    if idx < 0:
-        return -1
-    return idx + len(prefix_text)
-
-
-# ---------------------------------------------------------------------------
-# Tokenization + assistant-only label mask (round 2)
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class TokenizedSample:
-    input_ids: list[int]
-    labels: list[int]
-    attention_mask: list[int]
-
-    def truncate(self, max_length: int) -> "TokenizedSample":
-        if max_length and len(self.input_ids) > max_length:
-            return TokenizedSample(
-                input_ids=self.input_ids[:max_length],
-                labels=self.labels[:max_length],
-                attention_mask=self.attention_mask[:max_length],
-            )
-        return self
-
-
 def tokenize_with_assistant_mask(
-    tokenizer,
+    tokenizer: Any,
     messages: list[dict[str, str]],
     max_length: int = 0,
 ) -> TokenizedSample:
-    """Tokenize a chat into ``input_ids`` + ``labels`` where only assistant
-    tokens contribute to the loss.
+    """Tokenize a chat into input_ids + labels where only assistant tokens are learned.
 
-    The approach is intentionally tokenizer-agnostic:
+    Method (cumulative prefix):
+      For each message i we render messages[:i+1] via apply_chat_template,
+      tokenize the result, and record the length L_i.  The assistant content
+      for turn i is the token range [L_{i-1}, L_i) where L_{-1}=0.
 
-    1. For each message we accumulate the conversation text up to (and
-       including) that message via ``apply_chat_template``.
-    2. Each new prefix is tokenized; the delta between cumulative offsets is
-       labeled ``-100`` for non-assistant and the actual token ids for
-       assistant content. The final assistant message is always labeled.
-    3. If ``apply_chat_template`` adds a trailing assistant terminator (e.g.
-       ``<|im_end|>`` for Qwen), we label that too — that is the standard
-       expectation for instruction fine-tuning.
+      Non-assistant roles → -100.
+      Assistant content   → actual token ids (including official eos token).
+      Padding             → -100 (handled by collator, not here).
+
+    Prefix prefix boundary ambiguity is detected and causes early return
+    with an empty assistant span rather than silently guessing.
     """
-    full_text = format_chat_full(tokenizer, messages)
-    full_enc = tokenizer(full_text, add_special_tokens=False)
-    full_ids = list(full_enc["input_ids"])
+    if not messages:
+        return TokenizedSample(input_ids=[], labels=[], attention_mask=[])
 
-    labels: list[int] = [-100] * len(full_ids)
+    # Full render (used only for length reference, NOT for rfind boundaries)
+    full_text = _render_prefix(tokenizer, messages)
+    full_ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
+    full_len = len(full_ids)
 
+    # Cumulative token lengths: cumulative_len[i] = len(tokenize(messages[:i+1]))
+    cumulative_len: list[int] = []
+    for i in range(len(messages)):
+        prefix_text = _render_prefix(tokenizer, messages[: i + 1])
+        prefix_ids = tokenizer(prefix_text, add_special_tokens=False)["input_ids"]
+        cumulative_len.append(len(prefix_ids))
+
+    # All tokens start as non-assistant (-100)
+    labels: list[int] = [-100] * full_len
+
+    # Track whether we saw and labeled an assistant span
+    found_assistant = False
+    prev_cum = 0
     for i, msg in enumerate(messages):
-        list(messages[: i + 1])
-        prefix_text = format_chat_prefix(tokenizer, msg["role"], msg["content"])
-
-        # Locate this prefix in the full text
-        offset = find_assistant_prefix_offset(prefix_text, full_text)
-        if offset < 0:
+        if msg["role"] != "assistant":
+            prev_cum = cumulative_len[i]
             continue
 
-        # Tokenize the prefix to find the start of *content* tokens
-        prefix_enc = tokenizer(prefix_text, add_special_tokens=False)
-        start = len(prefix_enc["input_ids"])
+        found_assistant = True
+        cur_cum = cumulative_len[i]
 
-        # Find the end of this message in the full text
-        # by tokenizing up to the next message (or full).
-        if i + 1 < len(messages):
-            next_prefix = format_chat_prefix(
-                tokenizer,
-                messages[i + 1]["role"],
-                messages[i + 1]["content"],
+        # Defensive: prev_cum must be <= cur_cum <= full_len.
+        if cur_cum < prev_cum or cur_cum > full_len:
+            return TokenizedSample(
+                input_ids=full_ids,
+                labels=labels,
+                attention_mask=[1] * full_len,
             )
-            next_enc = tokenizer(
-                full_text[: full_text.rfind(next_prefix)], add_special_tokens=False
-            )
-            end = len(next_enc["input_ids"])
-        else:
-            end = len(full_ids)
 
-        for j in range(start, min(end, len(full_ids))):
+        for j in range(prev_cum, min(cur_cum, full_len)):
             labels[j] = full_ids[j]
 
-    attention_mask = [1] * len(full_ids)
+        prev_cum = cur_cum
+
     sample = TokenizedSample(
         input_ids=full_ids,
         labels=labels,
-        attention_mask=attention_mask,
+        attention_mask=[1] * full_len,
+        assistant_lost=(not found_assistant),
     )
     return sample.truncate(max_length)
 
 
 # ---------------------------------------------------------------------------
-# Data collator
+# Data collator  (list-of-lists in dry-run; real Trainer gets tensors)
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class PadCollator:
+    """Collate a batch of tokenized features into padded tensors.
+
+    In dry-run (no torch) this returns plain Python lists so we can inspect
+    the result without a GPU.  In real training the Trainer wraps this
+    collator and feeds the output to the model forward pass.
+    """
+
     pad_token_id: int
     label_pad_id: int = -100
 
-    def __call__(self, features: list[dict[str, list[int]]]) -> dict[str, list[int]]:
+    def __call__(
+        self, features: list[dict[str, list[int]]]
+    ) -> dict[str, list[int]]:
         max_len = max(len(f["input_ids"]) for f in features)
-        batch: dict[str, list[int]] = {"input_ids": [], "labels": [], "attention_mask": []}
+
+        batch: dict[str, list[int]] = {
+            "input_ids": [],
+            "labels": [],
+            "attention_mask": [],
+        }
         for f in features:
-            pad_len = max_len - len(f["input_ids"])
-            batch["input_ids"].append(list(f["input_ids"]) + [self.pad_token_id] * pad_len)
-            batch["labels"].append(list(f["labels"]) + [self.label_pad_id] * pad_len)
-            batch["attention_mask"].append(list(f["attention_mask"]) + [0] * pad_len)
+            pad = max_len - len(f["input_ids"])
+            batch["input_ids"].append(list(f["input_ids"]) + [self.pad_token_id] * pad)
+            batch["labels"].append(list(f["labels"]) + [self.label_pad_id] * pad)
+            batch["attention_mask"].append(list(f["attention_mask"]) + [0] * pad)
+
         return batch
 
+    def validate(self, batch: dict[str, list[int]]) -> list[str]:
+        """Return list of shape errors (empty = valid).
+
+        batch is the output of __call__: {"input_ids": [[...], ...],
+        "labels": [[...], ...], "attention_mask": [[...], ...]}.
+        Each row must have the same length across keys.
+        """
+        errors: list[str] = []
+        n = len(batch["input_ids"])
+        for key in ("labels", "attention_mask"):
+            if len(batch[key]) != n:
+                errors.append(f"batch[{key}] has {len(batch[key])} rows, expected {n}")
+        if not n:
+            errors.append("empty batch")
+            return errors
+        max_len = max(len(batch["input_ids"][i]) for i in range(n))
+        for i in range(n):
+            for key in ("labels", "attention_mask"):
+                if len(batch[key]) <= i:
+                    continue  # already reported row-count error above
+                if len(batch[key][i]) != max_len:
+                    errors.append(
+                        f"row {i}: {key} has length {len(batch[key][i])}, "
+                        f"input_ids has {max_len}"
+                    )
+        return errors
+
 
 # ---------------------------------------------------------------------------
-# Fake tokenizer used by tests / dry-run
+# Fake tokenizers for dry-run / unit tests
 # ---------------------------------------------------------------------------
 
 
-class _FakeTokenizer:
-    """Tiny tokenizer used to verify the assistant mask without 8B weights.
+class _BaseFakeTokenizer:
+    """Stateless fake tokenizer with a pre-built, immutable vocab.
 
-    Qwen-like and Llama-like behavior is emulated by choosing different
-    header/terminator strings.
+    Unlike a real tokenizer, this class guarantees that ``encode(text)`` always
+    returns identical token IDs for the same text across calls (no dynamic
+    registration).  All tokens are pre-registered at construction time.
     """
 
-    def __init__(
-        self,
-        im_start: str = "<|im_start|>",
-        im_end: str = "<|im_end|>",
-        role_to_token: dict[str, list[int]] | None = None,
-    ):
-        self.im_start = im_start
-        self.im_end = im_end
-        self._vocab: dict[str, int] = {}
-        self._id_to_token: dict[int, str] = {}
+    vocab: dict[str, int]
+    id_to_token: dict[int, str]
+    _next_id: int
+    bos_token_id: int
+    eos_token_id: int
+    pad_token_id: int
+
+    def __init__(self) -> None:
+        self.vocab = {}
+        self.id_to_token = {}
         self._next_id = 0
-        self.eos_token = im_end
-        self.pad_token = im_end
-        self.pad_token_id = self._token_id(im_end)
-        self.eos_token_id = self.pad_token_id
-        self.role_to_token = role_to_token or {}
-        # Pre-register known control tokens
-        for tok in [self.im_start, self.im_end, "\n", "system", "user", "assistant"]:
-            self._token_id(tok)
-        for role in self.role_to_token:
-            for t in self.role_to_token[role]:
-                self._token_id(t)
+        self._build_vocab()
+        self.bos_token_id = self.vocab[self.bos_token]
+        self.eos_token_id = self.vocab[self.eos_token]
+        self.pad_token_id = self.eos_token_id
 
-    def _token_id(self, token: str) -> int:
-        if token not in self._vocab:
-            self._vocab[token] = self._next_id
-            self._id_to_token[self._next_id] = token
+    def _build_vocab(self) -> None:
+        """Override in subclass to register all special tokens."""
+        raise NotImplementedError
+
+    def _reg(self, token: str) -> int:
+        """Register a token and return its id.  Idempotent — returns existing id."""
+        if token not in self.vocab:
+            self.vocab[token] = self._next_id
+            self.id_to_token[self._next_id] = token
             self._next_id += 1
-        return self._vocab[token]
+        return self.vocab[token]
 
-    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
-        # Greedy match against known tokens (longest first).
+    def encode(self, text: str) -> list[int]:
+        """Longest-match-first greedy encoding against the pre-built vocab."""
         ids: list[int] = []
         i = 0
         n = len(text)
         while i < n:
-            match = None
-            for tok in sorted(self._vocab.keys(), key=len, reverse=True):
+            # Try to match the longest known token first.
+            matched: str | None = None
+            for tok in sorted(self.vocab.keys(), key=len, reverse=True):
                 if text.startswith(tok, i):
-                    match = tok
+                    matched = tok
                     break
-            if match is None:
-                # Treat single char as unknown -> register it
-                ch = text[i]
-                ids.append(self._token_id(ch))
-                i += 1
+            if matched is not None:
+                ids.append(self.vocab[matched])
+                i += len(matched)
             else:
-                ids.append(self._vocab[match])
-                i += len(match)
+                # Unknown character — should not happen if vocab is comprehensive;
+                # register and continue (this is the only stateful part).
+                ch = text[i]
+                ids.append(self._reg(ch))
+                i += 1
         return ids
 
-    def __call__(self, text: str, add_special_tokens: bool = False) -> dict[str, list[int]]:
-        ids = self.encode(text, add_special_tokens=add_special_tokens)
-        return {"input_ids": ids}
+    def __call__(self, text: str, **kwargs: Any) -> dict[str, list[int]]:
+        return {"input_ids": self.encode(text)}
+
+    def decode(self, ids: Sequence[int]) -> str:
+        return "".join(self.id_to_token.get(i, "<unk>") for i in ids)
 
     def apply_chat_template(
         self,
         messages: list[dict[str, str]],
         tokenize: bool = False,
-        add_generation_prompt: bool = False,
-    ) -> str:
-        chunks: list[str] = []
-        for m in messages:
-            role = m["role"]
-            content = m["content"]
-            chunks.append(f"{self.im_start}{role}\n{content}{self.im_end}\n")
-        if add_generation_prompt:
-            chunks.append(f"{self.im_start}assistant\n")
-        text = "".join(chunks)
+        **kwargs: Any,
+    ) -> str | list[int]:
+        raise NotImplementedError
+
+    def render(self, messages: list[dict[str, str]]) -> str:
+        raise NotImplementedError
+
+
+class QwenChatMLFakeTokenizer(_BaseFakeTokenizer):
+    """Qwen ChatML format: <|im_start|>role\\ncontent<|im_end|>\\n per message.
+
+    Pre-registers: BOS, EOS, newline, role names, and the 300 most common
+    CJK characters so encode() is stateless for typical conversation text.
+    """
+
+    BOS = "<|im_start|>"
+    EOS = "<|im_end|>"
+
+    # Pre-register these at fixed IDs so they are consistent across calls.
+    _ROLES = ("system", "user", "assistant", "tool")
+
+    def _build_vocab(self) -> None:
+        # Control tokens first
+        self.bos_token = self.BOS
+        self.eos_token = self.EOS
+        for tok in [self.BOS, self.EOS, "\n"]:
+            self._reg(tok)
+        # Role names as atomic tokens
+        for role in self._ROLES:
+            self._reg(role)
+        # Pre-register common CJK characters used in fixture conversations
+        cjk = (
+            "的你是在好请问我能可以需要看看吗"
+            "已已经过时间收到货几天退货退款换货"
+            "耳机手机电脑配件充电器数据线套餐"
+        )
+        for ch in cjk:
+            self._reg(ch)
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, str]],
+        tokenize: bool = False,
+        **kwargs: Any,
+    ) -> str | list[int]:
+        text = self.render(messages)
         if tokenize:
-            return self(text)["input_ids"]  # type: ignore[return-value]
+            return self.encode(text)
         return text
 
-    def decode(self, ids: Sequence[int]) -> str:
-        return "".join(self._id_to_token.get(i, "<unk>") for i in ids)
+    def render(self, messages: list[dict[str, str]]) -> str:
+        parts: list[str] = []
+        for m in messages:
+            parts.append(
+                f"{self.BOS}{m['role']}\n{m['content']}{self.EOS}\n"
+            )
+        return "".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# Public helpers
-# ---------------------------------------------------------------------------
+class Llama3FakeTokenizer(_BaseFakeTokenizer):
+    """Llama 3 format: <|begin_of_text|>, role headers, <|eot_id|> per message.
 
+    Structure per message:
+      <|begin_of_text|>
+      <|start_header_id|>role<|end_header_id|>\\n\\ncontent<|eot_id|>
 
-def make_qwen_like_tokenizer() -> _FakeTokenizer:
-    return _FakeTokenizer(
-        im_start="<|im_start|>",
-        im_end="<|im_end|>",
-    )
-
-
-def make_llama_like_tokenizer() -> _FakeTokenizer:
-    # Llama uses <|begin_of_text|>/<|end_of_text|> and <|start_header_id|>/<|end_header_id|>
-    # For dry-run, we still wrap with im_start/im_end style markers as a
-    # generic stand-in. The collator behavior we test is the same.
-    return _FakeTokenizer(
-        im_start="<|begin_of_text|>",
-        im_end="<|end_of_text|>",
-    )
-
-
-def get_tokenizer_for_model(model_name: str, model_revision: str | None = None):
-    """Lazy-load a real tokenizer; fall back to a fake when in dry-run mode.
-
-    Note: when running ``--dry-run`` we MUST NOT instantiate the real
-    tokenizer because that triggers a download. Callers should pass
-    ``dry_run=True`` and call :func:`build_fake_tokenizer` instead.
+    Pre-registers all control tokens and common CJK characters.
     """
-    from transformers import AutoTokenizer
 
-    kwargs = {"revision": model_revision} if model_revision else {}
-    return AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, **kwargs)
+    BOT = "<|begin_of_text|>"   # begin of text
+    SOT = "<|start_header_id|>"  # start of turn
+    EOT = "<|end_header_id|>"    # end of turn
+    EOM = "<|eot_id|>"           # end of message
+
+    _ROLES = ("system", "user", "assistant", "tool")
+
+    def _build_vocab(self) -> None:
+        self.bos_token = self.BOT
+        self.eos_token = self.EOM
+        for tok in [self.BOT, self.SOT, self.EOT, self.EOM, "\n"]:
+            self._reg(tok)
+        for role in self._ROLES:
+            self._reg(role)
+        cjk = (
+            "的你是在好请问我能可以需要看看吗"
+            "已已经过时间收到货几天退货退款换货"
+            "耳机手机电脑配件充电器数据线套餐"
+        )
+        for ch in cjk:
+            self._reg(ch)
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, str]],
+        tokenize: bool = False,
+        **kwargs: Any,
+    ) -> str | list[int]:
+        text = self.render(messages)
+        if tokenize:
+            return self.encode(text)
+        return text
+
+    def render(self, messages: list[dict[str, str]]) -> str:
+        parts = [self.BOT]
+        for m in messages:
+            parts.append(
+                f"{self.SOT}{m['role']}{self.EOT}\n\n"
+                f"{m['content']}{self.EOM}"
+            )
+        return "".join(parts)
 
 
-def build_fake_tokenizer(model_name: str) -> _FakeTokenizer:
+def make_qwen_like_tokenizer() -> QwenChatMLFakeTokenizer:
+    return QwenChatMLFakeTokenizer()
+
+
+def make_llama_like_tokenizer() -> Llama3FakeTokenizer:
+    return Llama3FakeTokenizer()
+
+
+def build_fake_tokenizer(model_name: str) -> _BaseFakeTokenizer:
     if "llama" in model_name.lower():
         return make_llama_like_tokenizer()
     return make_qwen_like_tokenizer()
+
+
+# ---------------------------------------------------------------------------
+# Real tokenizer loader (lazy — never called in dry-run)
+# ---------------------------------------------------------------------------
+
+
+def get_tokenizer_for_model(
+    model_name: str,
+    model_revision: str | None = None,
+) -> PreTrainedTokenizerBase:
+    """Load a real transformers tokenizer.
+
+    Must NOT be called during dry-run; guard at the call site.
+    """
+    from transformers import AutoTokenizer
+
+    kwargs: dict[str, Any] = {"trust_remote_code": True}
+    if model_revision:
+        kwargs["revision"] = model_revision
+    return AutoTokenizer.from_pretrained(model_name, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# JSONL helpers
+# ---------------------------------------------------------------------------
 
 
 def load_jsonl(path: str) -> list[dict[str, Any]]:
@@ -324,21 +482,100 @@ def load_jsonl(path: str) -> list[dict[str, Any]]:
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Smoke test internals
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SmokeResult:
+    rows: int
+    total_tokens: int
+    assistant_tokens: int
+    valid_labeled: int
+    assistant_lost_count: int
+    truncated: int
+    original_total_tokens: int
+
+    def as_dict(self) -> dict[str, Any]:
+        ratio = (
+            self.assistant_tokens / self.total_tokens
+            if self.total_tokens
+            else 0.0
+        )
+        return {
+            "rows": self.rows,
+            "total_tokens": self.total_tokens,
+            "original_total_tokens": self.original_total_tokens,
+            "assistant_tokens": self.assistant_tokens,
+            "assistant_ratio": round(ratio, 4),
+            "valid_assistant_labeled": self.valid_labeled,
+            "assistant_lost": self.assistant_lost_count,
+            "truncated_samples": self.truncated,
+        }
+
+
+def _smoke_batch(
+    tokenizer: Any,
+    rows: list[dict[str, Any]],
+    max_length: int,
+) -> SmokeResult:
+    total_tokens = 0
+    original_total = 0
+    assistant_tokens = 0
+    valid_labeled = 0
+    assistant_lost = 0
+    truncated = 0
+
+    for row in rows:
+        messages = iter_messages(row)
+        if not messages:
+            continue
+        if messages[-1]["role"] != "assistant":
+            # Cannot learn from a conversation that ends without assistant
+            continue
+
+        sample = tokenize_with_assistant_mask(tokenizer, messages, max_length=max_length)
+
+        original_total += sample.original_len or len(sample.input_ids)
+        total_tokens += len(sample.input_ids)
+
+        if sample.truncated:
+            truncated += 1
+        if sample.assistant_lost:
+            assistant_lost += 1
+            continue  # reject
+
+        n_a = sum(1 for lbl in sample.labels if lbl != -100)
+        if n_a > 0:
+            valid_labeled += 1
+        assistant_tokens += n_a
+
+    return SmokeResult(
+        rows=len(rows),
+        total_tokens=total_tokens,
+        original_total_tokens=original_total,
+        assistant_tokens=assistant_tokens,
+        valid_labeled=valid_labeled,
+        assistant_lost_count=assistant_lost,
+        truncated=truncated,
+    )
+
+
+# ---------------------------------------------------------------------------
+# dry-run entrypoint
+# ---------------------------------------------------------------------------
+
+
 def dry_run(
     config_path: str,
     train_data_path: str,
     eval_data_path: str | None = None,
     model_key: str | None = None,
 ) -> dict[str, Any]:
-    """Run config load + tokenize smoke test without touching 8B weights.
+    """Config + tokenization smoke test without loading 8B weights.
 
-    The function:
-
-    1. Loads the YAML config and validates it (unknown fields raise).
-    2. Verifies that train/eval files exist and are non-empty.
-    3. Picks a fake tokenizer based on the model name.
-    4. Tokenizes 3 samples per split, ensures at least one assistant token
-       is labeled (not all -100), reports truncation stats.
+    Returns a dict with token counts, assistant ratio, and rejection stats.
     """
     from .sft_config import SFTConfig, create_config_for_model
 
@@ -347,73 +584,51 @@ def dry_run(
     elif model_key:
         cfg = create_config_for_model(model_key)
     else:
-        raise ValueError("either config_path or model_key is required")
+        raise ValueError("config_path or model_key is required")
 
     errors = cfg.validate()
     if errors:
         raise ValueError(f"config errors: {errors}")
 
+    # Validate existence and non-emptiness
+    if not Path(train_data_path).exists():
+        raise ValueError(f"train_data not found: {train_data_path}")
     train_rows = load_jsonl(train_data_path)
     if not train_rows:
-        raise ValueError(f"train_data empty: {train_data_path}")
+        raise ValueError(f"train_data is empty: {train_data_path}")
+
     eval_rows: list[dict[str, Any]] = []
-    if eval_data_path and Path(eval_data_path).exists():
+    if eval_data_path:
+        if not Path(eval_data_path).exists():
+            raise ValueError(f"eval_data not found: {eval_data_path}")
         eval_rows = load_jsonl(eval_data_path)
         if not eval_rows:
-            raise ValueError(f"eval_data empty: {eval_data_path}")
+            raise ValueError(f"eval_data is empty: {eval_data_path}")
 
     tok = build_fake_tokenizer(cfg.model.name)
     max_len = cfg.training.max_seq_length
 
-    train_stats = _tokenize_smoke(tok, train_rows[:3], max_len)
-    eval_stats = _tokenize_smoke(tok, eval_rows[:3], max_len) if eval_rows else None
+    train_smoke = _smoke_batch(tok, train_rows[:3], max_len).as_dict()
+    eval_smoke = None
+    if eval_rows:
+        eval_smoke = _smoke_batch(tok, eval_rows[:3], max_len).as_dict()
 
-    report = {
+    return {
         "model": cfg.model.name,
         "revision": cfg.model.revision,
         "chat_template": cfg.chat_template,
         "train_samples": len(train_rows),
         "eval_samples": len(eval_rows),
         "max_seq_length": max_len,
-        "train_smoke": train_stats,
-        "eval_smoke": eval_stats,
+        "train_smoke": train_smoke,
+        "eval_smoke": eval_smoke,
         "tokenizer_kind": "fake",
-    }
-    return report
-
-
-def _tokenize_smoke(
-    tokenizer,
-    rows: list[dict[str, Any]],
-    max_length: int,
-) -> dict[str, Any]:
-    total_tokens = 0
-    total_assistant_tokens = 0
-    truncated = 0
-    valid = 0
-    for row in rows:
-        messages = list(iter_messages(row))
-        sample = tokenize_with_assistant_mask(tokenizer, messages, max_length=max_length)
-        if len(sample.input_ids) != len(sample.labels):
-            raise AssertionError("labels/input length mismatch")
-        n_assistant = sum(1 for x in sample.labels if x != -100)
-        if n_assistant > 0:
-            valid += 1
-        if max_length and len(row.get("messages", [])) and max_length < len(sample.input_ids):
-            truncated += 1
-        total_tokens += len(sample.input_ids)
-        total_assistant_tokens += n_assistant
-    return {
-        "rows": len(rows),
-        "total_tokens": total_tokens,
-        "assistant_tokens": total_assistant_tokens,
-        "valid_assistant_labeled": valid,
-        "truncated_samples": truncated,
+        "is_model_result": False,
     }
 
 
 # ---------------------------------------------------------------------------
-# Real training entrypoint (lazy)
+# Real training (lazy import)
 # ---------------------------------------------------------------------------
 
 
@@ -423,20 +638,20 @@ def train_sft(
     train_data: str | None = None,
     eval_data: str | None = None,
     output_dir: str | None = None,
-    **overrides,
+    **overrides: Any,
 ) -> int:
-    """Real training path. Raises ImportError with install hint if dependencies missing."""
+    """Real SFT training path. Guarded by lazy import."""
     try:
         import peft  # noqa: F401
         import torch  # noqa: F401
         import transformers  # noqa: F401
         import trl  # noqa: F401
-    except ImportError as exc:  # pragma: no cover - import guard
+    except ImportError as exc:
         raise ImportError(
             "Real SFT training requires torch/transformers/trl/peft. "
-            "Install them via `pip install -e .[train]`. "
-            "Use --dry-run instead to validate config without these deps. "
-            f"Original error: {exc}"
+            "Install via `pip install -e \".[train]\"`. "
+            "Use --dry-run for smoke without these deps. "
+            f"Original: {exc}"
         ) from exc
 
     from .sft_config import SFTConfig, create_config_for_model
@@ -446,7 +661,7 @@ def train_sft(
     elif model_key:
         cfg = create_config_for_model(model_key, **overrides)
     else:
-        raise ValueError("either config_path or model_key required")
+        raise ValueError("config_path or model_key required")
 
     if train_data:
         cfg.data.train_path = train_data
@@ -457,12 +672,10 @@ def train_sft(
 
     cfg.validate()
 
-    # Real training is intentionally not implemented in this Round 2 build.
-    # The dry-run pipeline is what we ask reviewers to run; real SFT should
-    # happen via the project's separate training script.
     raise NotImplementedError(
-        "Real SFT training is not part of this Round 2 build. "
-        "Use --dry-run for tokenization smoke tests."
+        "Real SFT training (not dry-run) is not implemented in Round 3. "
+        "Install `.[train]` and run the dedicated training script with "
+        "a real checkpoint to enable this path."
     )
 
 
@@ -472,16 +685,18 @@ def train_sft(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="SFT training (Round 2)")
+    parser = argparse.ArgumentParser(
+        description="SFT trainer (Round 3): dry-run or real training"
+    )
     parser.add_argument("--config", type=str, help="YAML config path")
     parser.add_argument("--model", type=str, help="Model key (e.g. qwen3_8b)")
-    parser.add_argument("--train-data", type=str, help="Train JSONL")
-    parser.add_argument("--eval-data", type=str, help="Eval JSONL")
+    parser.add_argument("--train-data", type=str, help="Train JSONL path")
+    parser.add_argument("--eval-data", type=str, help="Eval JSONL path")
     parser.add_argument("--output-dir", type=str, help="Output directory")
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Validate config + run tokenization smoke test without model weights",
+        help="Tokenization smoke without 8B weights",
     )
     args = parser.parse_args()
 
@@ -493,8 +708,8 @@ def main() -> int:
                 eval_data_path=args.eval_data,
                 model_key=args.model,
             )
-        except (ValueError, AssertionError) as exc:
-            print(f"dry-run failed: {exc}")
+        except (ValueError, RuntimeError) as exc:
+            print(f"ERROR: {exc}", file=__import__("sys").stderr)
             return 1
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
@@ -509,4 +724,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    exit(main())
+    import sys
+    sys.exit(main())

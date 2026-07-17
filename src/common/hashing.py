@@ -24,7 +24,7 @@ class Hashing:
         joined = "|".join(str(p) for p in parts)
         if prefix:
             joined = f"{prefix}|{joined}"
-        return hashlib.sha256(joined.encode('utf-8')).hexdigest()
+        return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
     @staticmethod
     def short(*parts: object, prefix: str = "", length: int = 12) -> str:

@@ -25,10 +25,14 @@ LOCKED_VERSIONS = {
 }
 
 
+# Revisions known to be non-existent / placeholder
+PHANTOM_REVISIONS = frozenset(("", "v0.0.0", "main", "latest", "HEAD"))
+
+
 @dataclass
 class ModelConfig:
     name: str = "Qwen/Qwen3-8B"
-    revision: str = "v0.0.0"  # pin to a known snapshot
+    revision: str = "47719a242beab8f9aecc40ce3928b034dd5dd559"  # locked to Qwen3-8B upload commit
     trust_remote_code: bool = True
     chat_template: str = "qwen"  # "qwen" or "llama"
     revision_hint: str = ""  # human note (e.g. "requires HF license acceptance")
@@ -133,7 +137,7 @@ class SFTConfig:
 
     @classmethod
     def from_yaml(cls, path: str) -> "SFTConfig":
-        with open(path, encoding='utf-8') as f:
+        with open(path, encoding="utf-8") as f:
             config_dict = yaml.safe_load(f)
         return cls.from_dict(config_dict)
 
@@ -171,6 +175,11 @@ class SFTConfig:
         errors: list[str] = []
         if not self.model.name:
             errors.append("model.name is required")
+        if self.model.revision in PHANTOM_REVISIONS:
+            errors.append(
+                f"model.revision={self.model.revision!r} is a placeholder; "
+                "set a real HuggingFace commit SHA"
+            )
         # Don't require train_path to exist when running --dry-run with
         # --train-data override; here we only validate the configured file.
         if self.data.train_path and not Path(self.data.train_path).exists():
@@ -189,7 +198,7 @@ MODEL_MATRIX = {
     "qwen3_8b": {
         "name": "Qwen/Qwen3-8B",
         "chat_template": "qwen",
-        "revision": "v0.0.0",  # user can override
+        "revision": "47719a242beab8f9aecc40ce3928b034dd5dd559",  # locked
         "license_hint": "apache-2.0 (open)",
         "description": "Main experiment A - strong Chinese baseline",
     },
@@ -245,7 +254,7 @@ def create_config_for_model(
 
 def save_config(config: SFTConfig, path: str) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, 'w', encoding='utf-8') as f:
+    with open(path, "w", encoding="utf-8") as f:
         yaml.dump(config.to_dict(), f, default_flow_style=False, sort_keys=False)
 
 
@@ -370,12 +379,12 @@ def main() -> None:
     if args.create_configs:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
         qwen_path = Path(args.output_dir) / "sft_qwen3_8b.yaml"
-        with open(qwen_path, 'w', encoding='utf-8') as f:
+        with open(qwen_path, "w", encoding="utf-8") as f:
             f.write(SFT_QWEN_CONFIG)
         print(f"Created: {qwen_path}")
 
         llama_path = Path(args.output_dir) / "sft_llama3_8b.yaml"
-        with open(llama_path, 'w', encoding='utf-8') as f:
+        with open(llama_path, "w", encoding="utf-8") as f:
             f.write(SFT_LLAMA_CONFIG)
         print(f"Created: {llama_path}")
 

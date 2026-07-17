@@ -15,6 +15,7 @@ from pathlib import Path
 @dataclass
 class TextBlock:
     """A block of text with position information."""
+
     text: str
     page: int
     bbox: tuple[float, float, float, float]  # x0, y0, x1, y1
@@ -28,6 +29,7 @@ class TextBlock:
 @dataclass
 class TableCell:
     """A table cell."""
+
     text: str
     row: int
     col: int
@@ -38,6 +40,7 @@ class TableCell:
 @dataclass
 class Table:
     """A table with cells."""
+
     cells: list[list[str]]
     page: int
     bbox: tuple[float, float, float, float]
@@ -62,6 +65,7 @@ class Table:
 @dataclass
 class ParsedPage:
     """A parsed page with text blocks and tables."""
+
     page_num: int
     blocks: list[TextBlock]
     tables: list[Table]
@@ -71,6 +75,7 @@ class ParsedPage:
 @dataclass
 class ParsedDocument:
     """A fully parsed document."""
+
     doc_id: str
     title: str
     pages: list[ParsedPage]
@@ -119,7 +124,7 @@ class ParsedDocument:
             ],
         }
 
-        with open(output_path, 'w', encoding='utf-8') as f:
+        with open(output_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
 
@@ -177,39 +182,43 @@ class PDFParser:
                     last_y = None
 
                     for word in words:
-                        if last_y is None or abs(word['top'] - last_y) < 15:
+                        if last_y is None or abs(word["top"] - last_y) < 15:
                             current_block.append(word)
                         else:
                             if current_block:
-                                text = ' '.join(w['text'] for w in current_block)
+                                text = " ".join(w["text"] for w in current_block)
                                 bbox = (
-                                    min(w['x0'] for w in current_block),
-                                    min(w['top'] for w in current_block),
-                                    max(w['x1'] for w in current_block),
-                                    max(w['bottom'] for w in current_block),
+                                    min(w["x0"] for w in current_block),
+                                    min(w["top"] for w in current_block),
+                                    max(w["x1"] for w in current_block),
+                                    max(w["bottom"] for w in current_block),
                                 )
-                                blocks.append(TextBlock(
-                                    text=text,
-                                    page=page_num,
-                                    bbox=bbox,
-                                ))
+                                blocks.append(
+                                    TextBlock(
+                                        text=text,
+                                        page=page_num,
+                                        bbox=bbox,
+                                    )
+                                )
                             current_block = [word]
-                        last_y = word['top']
+                        last_y = word["top"]
 
                     # Don't forget last block
                     if current_block:
-                        text = ' '.join(w['text'] for w in current_block)
+                        text = " ".join(w["text"] for w in current_block)
                         bbox = (
-                            min(w['x0'] for w in current_block),
-                            min(w['top'] for w in current_block),
-                            max(w['x1'] for w in current_block),
-                            max(w['bottom'] for w in current_block),
+                            min(w["x0"] for w in current_block),
+                            min(w["top"] for w in current_block),
+                            max(w["x1"] for w in current_block),
+                            max(w["bottom"] for w in current_block),
                         )
-                        blocks.append(TextBlock(
-                            text=text,
-                            page=page_num,
-                            bbox=bbox,
-                        ))
+                        blocks.append(
+                            TextBlock(
+                                text=text,
+                                page=page_num,
+                                bbox=bbox,
+                            )
+                        )
 
                 # Extract tables
                 tables_found = page.extract_tables()
@@ -229,11 +238,13 @@ class PDFParser:
                 # Post-process: identify headers and footers
                 blocks = self._identify_headers_footers(blocks, page_num, page.height)
 
-                pages.append(ParsedPage(
-                    page_num=page_num,
-                    blocks=blocks,
-                    tables=tables,
-                ))
+                pages.append(
+                    ParsedPage(
+                        page_num=page_num,
+                        blocks=blocks,
+                        tables=tables,
+                    )
+                )
 
         return ParsedDocument(
             doc_id=doc_id,
@@ -268,22 +279,26 @@ class PDFParser:
                             text = span["text"].strip()
                             if text:
                                 bbox = tuple(span["bbox"])
-                                blocks.append(TextBlock(
-                                    text=text,
-                                    page=page_num,
-                                    bbox=bbox,
-                                    font=span.get("font"),
-                                    font_size=span.get("size"),
-                                ))
+                                blocks.append(
+                                    TextBlock(
+                                        text=text,
+                                        page=page_num,
+                                        bbox=bbox,
+                                        font=span.get("font"),
+                                        font_size=span.get("size"),
+                                    )
+                                )
 
             # Identify headers/footers
             blocks = self._identify_headers_footers(blocks, page_num, page.rect.height)
 
-            pages.append(ParsedPage(
-                page_num=page_num,
-                blocks=blocks,
-                tables=tables,
-            ))
+            pages.append(
+                ParsedPage(
+                    page_num=page_num,
+                    blocks=blocks,
+                    tables=tables,
+                )
+            )
 
         doc.close()
 
@@ -313,12 +328,14 @@ class PDFParser:
             for page_num, page in enumerate(result.pages):
                 blocks = []
                 for element in page.elements:
-                    if hasattr(element, 'text'):
-                        blocks.append(TextBlock(
-                            text=element.text,
-                            page=page_num,
-                            bbox=(0, 0, 0, 0),  # Docling format different
-                        ))
+                    if hasattr(element, "text"):
+                        blocks.append(
+                            TextBlock(
+                                text=element.text,
+                                page=page_num,
+                                bbox=(0, 0, 0, 0),  # Docling format different
+                            )
+                        )
                 pages.append(ParsedPage(page_num=page_num, blocks=blocks, tables=[]))
 
             return ParsedDocument(

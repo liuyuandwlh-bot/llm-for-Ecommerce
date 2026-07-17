@@ -52,7 +52,9 @@ def _to_reference(sample: dict[str, Any]) -> dict[str, Any]:
         "slots": sample.get("slots") or sample.get("context") or {},
         "policy_ids": list(sample.get("policy_ids") or sample.get("expected_policy_ids") or []),
         "decision": sample.get("decision") or sample.get("expected_decision") or "need_more_info",
-        "expected_missing_slots": list(sample.get("expected_missing_slots") or sample.get("missing_slots") or []),
+        "expected_missing_slots": list(
+            sample.get("expected_missing_slots") or sample.get("missing_slots") or []
+        ),
         "requires_human": bool(sample.get("requires_human", False)),
         "tool_expectation_dict": sample.get("tool_expectation_dict"),
     }
@@ -160,7 +162,9 @@ def _real_model_predict(
             gen_cfg.update(generation_config)
         with torch.no_grad():
             outputs = model.generate(**inputs, **gen_cfg)
-        decoded = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        decoded = tokenizer.decode(
+            outputs[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True
+        )
     except Exception as exc:  # pragma: no cover
         return False, None, f"generation failed: {exc}"
     return parse_prediction(decoded)
@@ -210,7 +214,9 @@ def run_evaluation(
             )
         records.append(
             {
-                "sample_id": sample.get("sample_id") or sample.get("case_id") or f"sample-{len(records)}",
+                "sample_id": sample.get("sample_id")
+                or sample.get("case_id")
+                or f"sample-{len(records)}",
                 "parsed": _prediction_to_dict(pred) if (ok and pred is not None) else None,
                 "parse_error": err,
                 "reference": _to_reference(sample),
@@ -234,8 +240,10 @@ def run_evaluation(
             for r in records:
                 f.write(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n")
         badcases = [
-            r for r in records
-            if (not r.get("parsed")) or (
+            r
+            for r in records
+            if (not r.get("parsed"))
+            or (
                 r["parsed"]
                 and (
                     r["parsed"]["decision"] != r["reference"]["decision"]

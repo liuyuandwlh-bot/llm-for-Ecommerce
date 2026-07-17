@@ -11,7 +11,7 @@
 
 ---
 
-## 项目状态（截至第二轮整改）
+## 项目状态（截至第三轮整改）
 
 | 模块                              | 状态 |
 | -------------------------------- | ---- |
@@ -156,9 +156,11 @@ input → schema_pass → registry_pass → pii_masked → policy_pass
 ### 3.5 SFT / DPO
 
 * **SFT**：`tokenize_with_assistant_mask` + `PadCollator` —— 仅 assistant token 参与 loss
+* Tokenization 方法：**累积前缀法**（非 rfind）：对每个 turn i，tokenize `messages[:i+1]` 获得 `cum_len[i]`，assistant span = `[cum_len[i-1], cum_len[i])`
 * `dry-run` 不加载模型，只做：
-  1. 配置严格校验（未知字段抛 `ValueError`）
-  2. 训练数据路径与 tokenization 烟雾测试（用 `QwenTokenizer` / `LlamaTokenizer` 兼容的 `_FakeTokenizer`）
+  1. 配置严格校验（未知字段抛 `ValueError`，phantom revision 如 `v0.0.0` 报错）
+  2. 训练数据路径与 tokenization 烟雾测试（用 `QwenChatMLFakeTokenizer` / `Llama3FakeTokenizer`）
+* **Qwen revision** 锁定为 `47719a242beab8f9aecc40ce3928b034dd5dd559`（HuggingFace 真实 commit SHA）
 * **DPO**：本轮明确转为 experimental。CLI 只有 `--check-schema` / `--validate-data`，不会真训练。
 
 ---
@@ -233,8 +235,11 @@ python -m pytest tests/ -q
 | 项 | 数量 |
 | --- | --- |
 | ruff 错误 | **0** |
-| pytest 通过 | **39 / 39** |
+| ruff format | **40 / 40** |
+| pytest 通过 | **87 / 87** |
 | 验收端到端 | SOP → Cases(26) → Convs(78) → Pipeline(train 27 / dev 7 / test 5)，`leak_count=0` |
+| Qwen revision | 锁定为 `47719a242beab8f9aecc40ce3928b034dd5dd559`（真实 commit） |
+| SFT assistant ratio | dry-run 实测 ~27%（train），~25%（dev） |
 
 ---
 

@@ -213,11 +213,7 @@ class SlotSchema:
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict, only including non-None fields."""
-        return {
-            key: value
-            for key, value in self.__dict__.items()
-            if value is not None
-        }
+        return {key: value for key, value in self.__dict__.items() if value is not None}
 
     @classmethod
     def from_dict(
@@ -321,9 +317,7 @@ class PolicyEngine:
             for d in p.get("decisions", []):
                 decision = d.get("decision")
                 if decision not in Decision._value2member_map_:
-                    raise ValueError(
-                        f"policy {pid} has unknown decision: {decision}"
-                    )
+                    raise ValueError(f"policy {pid} has unknown decision: {decision}")
 
     def _build_index(self) -> None:
         """Index policies by category for faster lookup."""

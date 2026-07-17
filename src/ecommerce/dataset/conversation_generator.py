@@ -48,6 +48,7 @@ def register_strategy(name: str):
     def deco(fn):
         _STRATEGY_REGISTRY[name] = fn
         return fn
+
     return deco
 
 
@@ -107,7 +108,7 @@ def _short(text: str, rng) -> str:
     out = text
     for s in starters:
         if out.startswith(s):
-            return out[len(s):]
+            return out[len(s) :]
     return out
 
 
@@ -290,9 +291,7 @@ class DeterministicConversationGenerator:
         rng = seeded_random("conv", local_seed)
 
         rewrite_fn = _STRATEGY_REGISTRY.get(rewrite_strategy, _identity)
-        original_user_turns = [
-            t for t in case.get("turns", []) if t.get("role") == "user"
-        ]
+        original_user_turns = [t for t in case.get("turns", []) if t.get("role") == "user"]
         rewritten_user_text = rewrite_fn(
             original_user_turns[0]["content"] if original_user_turns else "",
             rng,
@@ -307,7 +306,11 @@ class DeterministicConversationGenerator:
                 user_turns[i] = {"role": "user", "content": rewrite_fn(t.get("content", ""), rng)}
         elif rewrite_strategy == "missing_slot_followup":
             head = rewritten_user_text.split("，")[0]
-            tail = rewritten_user_text[len(head) + 1:] if len(rewritten_user_text) > len(head) + 1 else ""
+            tail = (
+                rewritten_user_text[len(head) + 1 :]
+                if len(rewritten_user_text) > len(head) + 1
+                else ""
+            )
             user_turns.append({"role": "user", "content": head})
             if tail.strip():
                 user_turns.append({"role": "user", "content": tail.strip(" ，,")})
@@ -327,13 +330,17 @@ class DeterministicConversationGenerator:
             # single-turn assistant behavior; intermediate assistant replies
             # (for multi-turn) come from `turns` already.
             if idx == len(user_turns) - 1:
-                messages.append({"role": "assistant", "content": _response_template_for(decision, rng)})
+                messages.append(
+                    {"role": "assistant", "content": _response_template_for(decision, rng)}
+                )
 
         # If the case has a pre-built user/assistant sequence (multi-turn
         # cases), append only the missing non-system assistant replies so the
         # final sequence always ends with assistant and contains policy content.
         case_turns = case.get("turns") or []
-        canonical_assistant_texts = [t["content"] for t in case_turns if t.get("role") == "assistant"]
+        canonical_assistant_texts = [
+            t["content"] for t in case_turns if t.get("role") == "assistant"
+        ]
         if canonical_assistant_texts:
             # Use the LAST canonical assistant text as the final assistant
             # turn (multi-turn -> last message = assistant).
@@ -391,7 +398,9 @@ class ConversationGenerator:
     fixed number of greeting variants.
     """
 
-    def __init__(self, policies: list | None = None, seed: int = 42, mode: str = "fixture", **kwargs):
+    def __init__(
+        self, policies: list | None = None, seed: int = 42, mode: str = "fixture", **kwargs
+    ):
         self.policies = policies
         self.seed = seed
         self.mode = mode
@@ -417,9 +426,7 @@ class ConversationGenerator:
         cases = list(cases)
         self.conversations = []
         for case in cases:
-            self.conversations.extend(
-                self._impl.generate_for_case(case)
-            )
+            self.conversations.extend(self._impl.generate_for_case(case))
         return self.conversations
 
     def run(
@@ -437,9 +444,9 @@ class ConversationGenerator:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         # Stable order: sort by sample_id
         ordered = sorted(self.conversations, key=lambda c: c.sample_id)
-        with open(output_path, 'w', encoding='utf-8') as f:
+        with open(output_path, "w", encoding="utf-8") as f:
             for conv in ordered:
-                f.write(json.dumps(conv.to_dict(), ensure_ascii=False, sort_keys=True) + '\n')
+                f.write(json.dumps(conv.to_dict(), ensure_ascii=False, sort_keys=True) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -494,9 +501,7 @@ class LLMGenerator:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Generate deterministic synthetic conversations"
-    )
+    parser = argparse.ArgumentParser(description="Generate deterministic synthetic conversations")
     parser.add_argument(
         "--policies",
         type=str,
@@ -537,7 +542,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    with open(args.cases, encoding='utf-8') as f:
+    with open(args.cases, encoding="utf-8") as f:
         cases = [json.loads(line) for line in f]
 
     gen = ConversationGenerator(seed=args.seed, mode=args.mode)

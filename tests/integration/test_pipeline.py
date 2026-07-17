@@ -1,18 +1,16 @@
 """Integration tests for the complete Round 2 pipeline."""
 
 import json
-import tempfile
-from pathlib import Path
 
 import pytest
 
 from src.ecommerce.dataset import (
-    SOPBuilder,
     CanonicalCaseGenerator,
-    PolicyEngine,
     PipelineConfig,
-    validate_canonical_cases,
+    PolicyEngine,
+    SOPBuilder,
     run_pipeline,
+    validate_canonical_cases,
 )
 from src.ecommerce.dataset.conversation_generator import (
     ConversationGenerator,
@@ -25,7 +23,7 @@ class TestPolicyCaseRoundtrip:
         policies = builder.build_fictional_store_sops()
         policies_dict = [p.to_dict() for p in policies]
         policies_path = tmp_path / "policies.json"
-        policies_path.write_text(json.dumps(policies_dict, ensure_ascii=False))
+        policies_path.write_text(json.dumps(policies_dict, ensure_ascii=False), encoding="utf-8")
 
         gen = CanonicalCaseGenerator()
         cases = gen.generate_all()
@@ -42,7 +40,7 @@ class TestPolicyCaseRoundtrip:
         severity, errors = validate_canonical_cases(policies_dict, loaded)
         assert severity == 0, errors
 
-        engine = PolicyEngine(policies_dict)
+        _ = PolicyEngine(policies_dict)
         engine_categories = {p["policy_id"] for p in policies_dict}
         referenced = set()
         for case in loaded:
@@ -57,7 +55,7 @@ class TestConversationGeneratorCLI:
         builder = SOPBuilder()
         policies = [p.to_dict() for p in builder.build_fictional_store_sops()]
         policies_path = tmp_path / "policies.json"
-        policies_path.write_text(json.dumps(policies, ensure_ascii=False))
+        policies_path.write_text(json.dumps(policies, ensure_ascii=False), encoding="utf-8")
 
         gen = CanonicalCaseGenerator()
         cases = [c.to_dict() for c in gen.generate_all()]
@@ -73,11 +71,7 @@ class TestConversationGeneratorCLI:
         )
         cg.run(str(out_path), cases=cases)
 
-        lines = [
-            l
-            for l in out_path.read_text(encoding="utf-8").splitlines()
-            if l.strip()
-        ]
+        lines = [ln for ln in out_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
         assert len(lines) >= 1
         first = json.loads(lines[0])
         assert "messages" in first and first["messages"]
@@ -87,7 +81,7 @@ class TestConversationGeneratorCLI:
         assert roles[-1] == "assistant"
         assert roles[0] == "system"
         # No two adjacent same-role messages.
-        for a, b in zip(roles, roles[1:]):
+        for a, b in zip(roles, roles[1:], strict=False):
             assert a != b
 
 
@@ -109,7 +103,7 @@ class TestDataPipelineRoundtrip:
         ).run(str(out_path), cases=cases)
 
         policy_path = tmp_path / "policies.json"
-        policy_path.write_text(json.dumps(policies, ensure_ascii=False))
+        policy_path.write_text(json.dumps(policies, ensure_ascii=False), encoding="utf-8")
 
         registry_path = tmp_path / "registry.json"
         registry_path.write_text(
@@ -128,7 +122,8 @@ class TestDataPipelineRoundtrip:
                     ]
                 },
                 ensure_ascii=False,
-            )
+            ),
+            encoding="utf-8",
         )
 
         output_dir = tmp_path / "out"

@@ -16,6 +16,7 @@ from sentence_transformers import CrossEncoder
 @dataclass
 class RerankResult:
     """A reranked result."""
+
     chunk_id: str
     text: str
     doc_id: str
@@ -43,7 +44,9 @@ class CrossEncoderReranker:
         batch_size: int = 32,
     ):
         self.model_name = model_name
-        self.device = device if device == "cpu" else ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = (
+            device if device == "cpu" else ("cuda" if torch.cuda.is_available() else "cpu")
+        )
         self.max_length = max_length
         self.batch_size = batch_size
 
@@ -80,23 +83,25 @@ class CrossEncoderReranker:
         # Score in batches
         scores = []
         for i in range(0, len(pairs), self.batch_size):
-            batch_pairs = pairs[i:i + self.batch_size]
+            batch_pairs = pairs[i : i + self.batch_size]
             batch_scores = self.model.predict(batch_pairs, show_progress_bar=False)
             scores.extend(batch_scores.tolist())
 
         # Combine with original scores
         reranked = []
         for result, score in zip(results, scores, strict=False):
-            reranked.append(RerankResult(
-                chunk_id=result["chunk_id"],
-                text=result["text"],
-                doc_id=result.get("doc_id", ""),
-                page_start=result.get("page_start", 0),
-                page_end=result.get("page_end", 0),
-                original_score=result.get("score", 0),
-                rerank_score=float(score),
-                source=result.get("source", ""),
-            ))
+            reranked.append(
+                RerankResult(
+                    chunk_id=result["chunk_id"],
+                    text=result["text"],
+                    doc_id=result.get("doc_id", ""),
+                    page_start=result.get("page_start", 0),
+                    page_end=result.get("page_end", 0),
+                    original_score=result.get("score", 0),
+                    rerank_score=float(score),
+                    source=result.get("source", ""),
+                )
+            )
 
         # Sort by rerank score
         reranked.sort(key=lambda x: x.rerank_score, reverse=True)

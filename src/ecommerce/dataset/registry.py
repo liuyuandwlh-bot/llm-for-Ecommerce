@@ -63,7 +63,7 @@ class SourceEntry:
 
 def load_registry(path: str) -> dict[str, SourceEntry]:
     """Load registry JSON into a dict keyed by source_id."""
-    with open(path, encoding='utf-8') as f:
+    with open(path, encoding="utf-8") as f:
         raw = json.load(f)
     if isinstance(raw, list):
         rows = raw
@@ -113,7 +113,7 @@ def _validate_row(row: dict[str, Any]) -> None:
 def save_registry(path: str, registry: dict[str, SourceEntry]) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     rows = [vars(entry) for entry in registry.values()]
-    with open(path, 'w', encoding='utf-8') as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(rows, f, ensure_ascii=False, indent=2)
 
 

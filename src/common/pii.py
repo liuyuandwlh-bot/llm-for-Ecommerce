@@ -12,6 +12,7 @@ from enum import IntEnum
 
 class PIIType(IntEnum):
     """PII types with priority (higher = more specific)."""
+
     PHONE_FIXED = 1
     PHONE_CN = 2
     EMAIL = 3
@@ -24,6 +25,7 @@ class PIIType(IntEnum):
 @dataclass
 class PIIMatch:
     """A PII match with location and type."""
+
     pii_type: str
     text: str
     start: int
@@ -41,19 +43,19 @@ class PIIDetector:
     # Regex patterns for PII detection (ordered by specificity)
     PATTERNS = [
         # Fixed phone (must check before mobile)
-        ("phone_fixed", r'0\d{2,3}-?\d{7,8}', PIIType.PHONE_FIXED),
+        ("phone_fixed", r"0\d{2,3}-?\d{7,8}", PIIType.PHONE_FIXED),
         # Chinese mobile
-        ("phone_cn", r'1[3-9]\d{9}', PIIType.PHONE_CN),
+        ("phone_cn", r"1[3-9]\d{9}", PIIType.PHONE_CN),
         # Email
-        ("email", r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', PIIType.EMAIL),
+        ("email", r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", PIIType.EMAIL),
         # Chinese ID card (18 digits)
-        ("id_card", r'\d{17}[\dXx]', PIIType.ID_CARD),
+        ("id_card", r"\d{17}[\dXx]", PIIType.ID_CARD),
         # Bank card (16 digits minimum)
-        ("bank_card", r'\b\d{16,19}\b', PIIType.BANK_CARD),
+        ("bank_card", r"\b\d{16,19}\b", PIIType.BANK_CARD),
         # Order ID pattern
-        ("order_id", r'(?:订单号|订单|单号)[：:\s]*([A-Z0-9]{10,})', PIIType.ORDER_ID),
+        ("order_id", r"(?:订单号|订单|单号)[：:\s]*([A-Z0-9]{10,})", PIIType.ORDER_ID),
         # Passport
-        ("passport", r'[A-Z]{1,2}\d{6,9}', PIIType.PASSPORT),
+        ("passport", r"[A-Z]{1,2}\d{6,9}", PIIType.PASSPORT),
     ]
 
     # Placeholder templates (no real content retained)
@@ -70,8 +72,7 @@ class PIIDetector:
     def __init__(self):
         # Compile patterns
         self.compiled_patterns: list[tuple[str, re.Pattern, PIIType]] = [
-            (name, re.compile(pattern), ptype)
-            for name, pattern, ptype in self.PATTERNS
+            (name, re.compile(pattern), ptype) for name, pattern, ptype in self.PATTERNS
         ]
 
         # Track entity mappings for consistent masking
@@ -89,13 +90,15 @@ class PIIDetector:
 
         for name, pattern, ptype in self.compiled_patterns:
             for match in pattern.finditer(text):
-                all_matches.append((
-                    match.start(),
-                    match.end(),
-                    name,
-                    match.group(),
-                    ptype,
-                ))
+                all_matches.append(
+                    (
+                        match.start(),
+                        match.end(),
+                        name,
+                        match.group(),
+                        ptype,
+                    )
+                )
 
         # Sort by start position
         all_matches.sort(key=lambda x: (x[0], -x[4]))
@@ -106,21 +109,27 @@ class PIIDetector:
         # Build PIIMatch objects
         matches = []
         for match_info in resolved:
-            start, end, pii_type, text_content = match_info[0], match_info[1], match_info[2], match_info[3]
+            start, end, pii_type, text_content = (
+                match_info[0],
+                match_info[1],
+                match_info[2],
+                match_info[3],
+            )
             masked = self._get_placeholder(pii_type, text_content)
-            matches.append(PIIMatch(
-                pii_type=pii_type,
-                text=text_content,
-                start=start,
-                end=end,
-                masked=masked,
-            ))
+            matches.append(
+                PIIMatch(
+                    pii_type=pii_type,
+                    text=text_content,
+                    start=start,
+                    end=end,
+                    masked=masked,
+                )
+            )
 
         return matches
 
     def _resolve_overlaps(
-        self,
-        matches: list[tuple[int, int, str, str, PIIType]]
+        self, matches: list[tuple[int, int, str, str, PIIType]]
     ) -> list[tuple[int, int, str, str, PIIType]]:
         """
         Resolve overlapping matches.
@@ -212,6 +221,7 @@ def mask_pii_in_text(text: str) -> str:
 # Unit Tests
 # ============================================================
 
+
 def test_overlapping_phone_email():
     """Test overlapping phone number in email is handled."""
     detector = PIIDetector()
@@ -300,9 +310,9 @@ if __name__ == "__main__":
     print("\nAll tests passed!")
 
     # Demo
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Demo:")
-    print("="*60)
+    print("=" * 60)
 
     detector = PIIDetector()
     test_texts = [

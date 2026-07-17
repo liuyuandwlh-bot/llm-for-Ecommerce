@@ -102,7 +102,9 @@ def generate_parent_id(
     index: int = 0,
 ) -> str:
     norm = re.sub(r"\s+", " ", text or "").strip()
-    return "p_" + _stable_id(doc_id, "parent", section or "", page_start, page_end, index, norm[:120])
+    return "p_" + _stable_id(
+        doc_id, "parent", section or "", page_start, page_end, index, norm[:120]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +147,9 @@ def _estimate_tokens(text: str) -> int:
 def _is_section_header(text: str) -> bool:
     if not text:
         return False
-    if len(text) < 50 and any(text.startswith(p) for p in ["第", "一", "二", "三", "四", "五", "六", "七"]):
+    if len(text) < 50 and any(
+        text.startswith(p) for p in ["第", "一", "二", "三", "四", "五", "六", "七"]
+    ):
         return True
     if 2 < len(text) < 50 and text.rstrip()[-1] in "：:":
         return True
@@ -199,7 +203,8 @@ class ChunkBuilder:
                 chunks.append(self._create_table_chunk(table, doc_id, page_num))
 
         text_blocks = [
-            b for b in (getattr(page, "blocks", []) or [])
+            b
+            for b in (getattr(page, "blocks", []) or [])
             if not getattr(b, "is_header", False)
             and not getattr(b, "is_footer", False)
             and (getattr(b, "text", "") or "").strip()
@@ -259,9 +264,13 @@ class ChunkBuilder:
         page_start = min(pages) if pages else 0
         page_end = max(pages) if pages else 0
         chunk_id = generate_chunk_id(
-            doc_id, text, chunk_type,
-            page_start=page_start, page_end=page_end,
-            section=section, index=index,
+            doc_id,
+            text,
+            chunk_type,
+            page_start=page_start,
+            page_end=page_end,
+            section=section,
+            index=index,
         )
         self._check_unique(chunk_id)
         return Chunk(
@@ -282,9 +291,13 @@ class ChunkBuilder:
         headers = getattr(table, "headers", []) or []
         cells = getattr(table, "cells", []) or []
         chunk_id = generate_chunk_id(
-            doc_id, markdown, "table",
-            page_start=page_num, page_end=page_num,
-            section=None, index=0,
+            doc_id,
+            markdown,
+            "table",
+            page_start=page_num,
+            page_end=page_num,
+            section=None,
+            index=0,
         )
         self._check_unique(chunk_id)
         return Chunk(
@@ -320,9 +333,12 @@ class ChunkBuilder:
             page_start = min(current_pages)
             page_end = max(current_pages)
             parent_id = generate_parent_id(
-                doc_id, combined,
-                page_start=page_start, page_end=page_end,
-                section=current_children[0].section, index=len(parents),
+                doc_id,
+                combined,
+                page_start=page_start,
+                page_end=page_end,
+                section=current_children[0].section,
+                index=len(parents),
             )
             self._check_unique(parent_id)
             parent = Chunk(
@@ -350,9 +366,12 @@ class ChunkBuilder:
                 flush()
                 # Tables become their own parent
                 table_parent_id = generate_parent_id(
-                    doc_id, child.text,
-                    page_start=child.page_start, page_end=child.page_end,
-                    section=child.section, index=len(parents),
+                    doc_id,
+                    child.text,
+                    page_start=child.page_start,
+                    page_end=child.page_end,
+                    section=child.section,
+                    index=len(parents),
                 )
                 self._check_unique(table_parent_id)
                 table_parent = Chunk(
@@ -395,7 +414,9 @@ class ChunkBuilder:
 # ---------------------------------------------------------------------------
 
 
-def chunk_corpus(input_dir: str, output_path: str, config: ChunkConfig | None = None) -> ChunkingResult:
+def chunk_corpus(
+    input_dir: str, output_path: str, config: ChunkConfig | None = None
+) -> ChunkingResult:
     """Chunk all parsed JSON documents in ``input_dir`` and write JSONL."""
     builder = ChunkBuilder(config)
     all_children: list[Chunk] = []
@@ -467,6 +488,7 @@ def chunk_corpus(input_dir: str, output_path: str, config: ChunkConfig | None = 
 
 def main() -> int:
     import argparse
+
     parser = argparse.ArgumentParser(description="Chunk parsed finance documents")
     parser.add_argument("--input", required=True, help="Directory of parsed JSON documents")
     parser.add_argument("--output", required=True, help="Output JSONL path")
@@ -474,14 +496,18 @@ def main() -> int:
     parser.add_argument("--parent-chunk-size", type=int, default=2048)
     args = parser.parse_args()
 
-    config = ChunkConfig(max_chunk_size=args.max_chunk_size, parent_chunk_size=args.parent_chunk_size)
+    config = ChunkConfig(
+        max_chunk_size=args.max_chunk_size, parent_chunk_size=args.parent_chunk_size
+    )
     try:
         result = chunk_corpus(args.input, args.output, config=config)
     except FileNotFoundError as exc:
         print(f"error: {exc}")
         return 1
 
-    print(f"Wrote {len(result.children)} children and {len(result.parents)} parents to {args.output}")
+    print(
+        f"Wrote {len(result.children)} children and {len(result.parents)} parents to {args.output}"
+    )
     return 0
 
 

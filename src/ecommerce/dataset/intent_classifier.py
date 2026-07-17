@@ -10,6 +10,7 @@ from enum import Enum
 
 class Intent(str, Enum):
     """Customer service intent categories."""
+
     # Logistics
     LOGISTICS_QUERY = "logistics_query"  # 物流查询
     LOGISTICS_EXCEPTION = "logistics_exception"  # 物流异常
@@ -48,6 +49,7 @@ class Intent(str, Enum):
 
 class Slot(str, Enum):
     """Slot types for extracting structured information."""
+
     # Order Information
     ORDER_ID = "order_id"  # 订单号
     PRODUCT_NAME = "product_name"  # 商品名称
@@ -96,6 +98,7 @@ class Slot(str, Enum):
 @dataclass
 class IntentRule:
     """Rule-based intent classification."""
+
     intent: Intent
     keywords: list[str]
     exclude_keywords: list[str] = field(default_factory=list)
@@ -109,79 +112,71 @@ INTENT_RULES = [
         intent=Intent.LOGISTICS_QUERY,
         keywords=["物流", "快递", "发货", "到哪了", "什么时候到", "派送", "运输"],
         exclude_keywords=["延迟", "异常", "丢了"],
-        patterns=["物流查询", "快递查询", "发货时间", "预计送达"]
+        patterns=["物流查询", "快递查询", "发货时间", "预计送达"],
     ),
     IntentRule(
         intent=Intent.LOGISTICS_EXCEPTION,
         keywords=["丢件", "破损", "丢失", "异常"],
-        patterns=["物流异常", "丢件", "快递丢失", "包裹丢失"]
+        patterns=["物流异常", "丢件", "快递丢失", "包裹丢失"],
     ),
     IntentRule(
         intent=Intent.DELIVERY_DELAY,
         keywords=["延迟", "晚了", "超时", "一直没到"],
-        patterns=["发货延迟", "配送延迟", "延迟发货"]
+        patterns=["发货延迟", "配送延迟", "延迟发货"],
     ),
-
     # Returns
     IntentRule(
         intent=Intent.RETURN_QUERY,
         keywords=["退货", "能不能退", "可以退吗", "退掉"],
-        patterns=["退货咨询", "退货政策", "怎么退货"]
+        patterns=["退货咨询", "退货政策", "怎么退货"],
     ),
     IntentRule(
         intent=Intent.RETURN_APPLICATION,
         keywords=["申请退货", "要退货", "想退货"],
-        patterns=["退货申请", "申请退"]
+        patterns=["退货申请", "申请退"],
     ),
-
     # Exchanges
     IntentRule(
         intent=Intent.EXCHANGE_QUERY,
         keywords=["换货", "换一下", "换一个", "换尺码", "换颜色"],
-        patterns=["换货咨询", "换货政策", "怎么换货"]
+        patterns=["换货咨询", "换货政策", "怎么换货"],
     ),
-
     # Specifications
     IntentRule(
         intent=Intent.PRODUCT_SPEC,
         keywords=["参数", "规格", "尺寸", "材质", "功能", "介绍"],
-        patterns=["商品规格", "产品参数", "详细介绍"]
+        patterns=["商品规格", "产品参数", "详细介绍"],
     ),
     IntentRule(
         intent=Intent.COMPATIBILITY,
         keywords=["兼容", "能用吗", "适配", "配对", "支持"],
-        patterns=["兼容", "适配", "能不能用"]
+        patterns=["兼容", "适配", "能不能用"],
     ),
-
     # Coupons
     IntentRule(
         intent=Intent.COUPON_QUERY,
         keywords=["优惠券", "优惠码", "能不能用券", "红包"],
-        patterns=["优惠券", "优惠码", "红包"]
+        patterns=["优惠券", "优惠码", "红包"],
     ),
     IntentRule(
         intent=Intent.PRICE_PROTECTION,
         keywords=["价保", "保价", "降价", "差价", "退差价"],
-        patterns=["价格保护", "价保", "差价退款"]
+        patterns=["价格保护", "价保", "差价退款"],
     ),
-
     # Complaints
     IntentRule(
         intent=Intent.COMPLAINT,
         keywords=["投诉", "不满", "太差", "态度", "欺骗", "虚假宣传"],
-        patterns=["投诉", "举报", "差评"]
+        patterns=["投诉", "举报", "差评"],
     ),
     IntentRule(
         intent=Intent.ESCALATE,
         keywords=["转人工", "人工客服", "人工", "找人工", "主管", "经理"],
-        patterns=["转人工", "人工服务", "人工客服"]
+        patterns=["转人工", "人工服务", "人工客服"],
     ),
-
     # Greetings
     IntentRule(
-        intent=Intent.GREETING,
-        keywords=["你好", "hi", "hello", "在吗", "在不在"],
-        patterns=[]
+        intent=Intent.GREETING, keywords=["你好", "hi", "hello", "在吗", "在不在"], patterns=[]
     ),
 ]
 
@@ -238,7 +233,11 @@ class IntentClassifier:
         """Get required slots for a given intent."""
         required_slots_map = {
             Intent.LOGISTICS_QUERY: [Slot.ORDER_ID, Slot.TRACKING_NUMBER],
-            Intent.LOGISTICS_EXCEPTION: [Slot.ORDER_ID, Slot.TRACKING_NUMBER, Slot.ISSUE_DESCRIPTION],
+            Intent.LOGISTICS_EXCEPTION: [
+                Slot.ORDER_ID,
+                Slot.TRACKING_NUMBER,
+                Slot.ISSUE_DESCRIPTION,
+            ],
             Intent.RETURN_QUERY: [Slot.PRODUCT_NAME, Slot.DAYS_SINCE_DELIVERY],
             Intent.RETURN_APPLICATION: [Slot.ORDER_ID, Slot.RETURN_REASON, Slot.PRODUCT_CONDITION],
             Intent.EXCHANGE_QUERY: [Slot.PRODUCT_NAME],
@@ -260,19 +259,16 @@ def get_slot_extraction_prompts(intent: Intent) -> dict[str, str]:
 - 订单号（如有）
 - 快递单号（如有）
 - 具体物流问题""",
-
         Intent.RETURN_QUERY: """从用户查询中提取退货相关信息：
 - 商品名称或类别
 - 收货天数
 - 商品状况（是否拆封、是否损坏）
 - 配件是否齐全
 - 退货原因""",
-
         Intent.EXCHANGE_QUERY: """从用户查询中提取换货相关信息：
 - 商品名称或类别
 - 换货原因（尺码、颜色、质量）
 - 期望的尺码或颜色""",
-
         Intent.COMPLAINT: """从用户查询中提取投诉相关信息：
 - 投诉类型（服务态度、商品问题、虚假宣传等）
 - 具体情况描述

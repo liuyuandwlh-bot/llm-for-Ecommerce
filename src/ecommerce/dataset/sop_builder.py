@@ -20,12 +20,15 @@ from typing import Any, Literal
 # Policy Decision Categories
 ReturnDecision = Literal["full_refund", "exchange", "manual_inspection", "reject"]
 ExchangeDecision = Literal["exchange", "repair", "reject"]
-LogisticsDecision = Literal["ship_within_48h", "cancel_with_compensation", "resend_or_refund", "need_more_info"]
+LogisticsDecision = Literal[
+    "ship_within_48h", "cancel_with_compensation", "resend_or_refund", "need_more_info"
+]
 
 
 @dataclass
 class PolicyCondition:
     """A single condition for a policy decision."""
+
     field: str
     operator: str  # eq, ne, gt, lt, gte, lte, in, not_in
     value: Any
@@ -35,6 +38,7 @@ class PolicyCondition:
 @dataclass
 class PolicyDecision:
     """A decision outcome with conditions."""
+
     decision: str
     reasoning: str
     requires_human: bool = False
@@ -44,6 +48,7 @@ class PolicyDecision:
 @dataclass
 class Policy:
     """A complete policy with conditions and decisions."""
+
     policy_id: str  # Stable, explicitly defined
     version: str
     effective_from: str
@@ -150,7 +155,7 @@ class SOPBuilder:
         description: str,
         conditions: list[dict],
         decisions: list[dict],
-        evidence: str = ""
+        evidence: str = "",
     ) -> Policy:
         """Add a return policy."""
         return self.add_policy(
@@ -174,14 +179,33 @@ class SOPBuilder:
             title="7天无理由退货（未拆封）",
             description="商品未拆封且不影响二次销售，可在7天内申请退货",
             conditions=[
-                {"field": "days_since_delivery", "operator": "lte", "value": 7, "description": "收货7天内"},
-                {"field": "package_status", "operator": "eq", "value": "unopened", "description": "包装未拆封"},
-                {"field": "user_damage", "operator": "eq", "value": False, "description": "无人为损坏"},
+                {
+                    "field": "days_since_delivery",
+                    "operator": "lte",
+                    "value": 7,
+                    "description": "收货7天内",
+                },
+                {
+                    "field": "package_status",
+                    "operator": "eq",
+                    "value": "unopened",
+                    "description": "包装未拆封",
+                },
+                {
+                    "field": "user_damage",
+                    "operator": "eq",
+                    "value": False,
+                    "description": "无人为损坏",
+                },
             ],
             decisions=[
-                {"decision": "full_refund", "reasoning": "符合7天无理由退货条件", "requires_human": False}
+                {
+                    "decision": "full_refund",
+                    "reasoning": "符合7天无理由退货条件",
+                    "requires_human": False,
+                }
             ],
-            evidence="虚构商家售后SOP 第3.1条"
+            evidence="虚构商家售后SOP 第3.1条",
         )
 
         # return_002: 7天无理由退货（已拆封完好）
@@ -190,15 +214,39 @@ class SOPBuilder:
             title="7天无理由退货（已拆封完好）",
             description="已拆封但商品完好、配件齐全，可在7天内申请退货",
             conditions=[
-                {"field": "days_since_delivery", "operator": "lte", "value": 7, "description": "收货7天内"},
-                {"field": "package_status", "operator": "eq", "value": "opened", "description": "包装已拆封"},
-                {"field": "user_damage", "operator": "eq", "value": False, "description": "无人为损坏"},
-                {"field": "accessories_complete", "operator": "eq", "value": True, "description": "配件齐全"},
+                {
+                    "field": "days_since_delivery",
+                    "operator": "lte",
+                    "value": 7,
+                    "description": "收货7天内",
+                },
+                {
+                    "field": "package_status",
+                    "operator": "eq",
+                    "value": "opened",
+                    "description": "包装已拆封",
+                },
+                {
+                    "field": "user_damage",
+                    "operator": "eq",
+                    "value": False,
+                    "description": "无人为损坏",
+                },
+                {
+                    "field": "accessories_complete",
+                    "operator": "eq",
+                    "value": True,
+                    "description": "配件齐全",
+                },
             ],
             decisions=[
-                {"decision": "full_refund", "reasoning": "已拆封但商品完好，符合退货条件", "requires_human": False}
+                {
+                    "decision": "full_refund",
+                    "reasoning": "已拆封但商品完好，符合退货条件",
+                    "requires_human": False,
+                }
             ],
-            evidence="虚构商家售后SOP 第3.2条"
+            evidence="虚构商家售后SOP 第3.2条",
         )
 
         # return_003: 质量问题退货
@@ -207,14 +255,32 @@ class SOPBuilder:
             title="质量问题退货",
             description="商品存在质量问题，不受7天限制，可申请退货",
             conditions=[
-                {"field": "quality_issue", "operator": "eq", "value": True, "description": "确认存在质量问题"},
-                {"field": "has_proof", "operator": "eq", "value": True, "description": "有质量问题凭证"},
+                {
+                    "field": "quality_issue",
+                    "operator": "eq",
+                    "value": True,
+                    "description": "确认存在质量问题",
+                },
+                {
+                    "field": "has_proof",
+                    "operator": "eq",
+                    "value": True,
+                    "description": "有质量问题凭证",
+                },
             ],
             decisions=[
-                {"decision": "full_refund", "reasoning": "质量问题可申请退货退款", "requires_human": False},
-                {"decision": "manual_inspection", "reasoning": "需要人工核实质量问题", "requires_human": True}
+                {
+                    "decision": "full_refund",
+                    "reasoning": "质量问题可申请退货退款",
+                    "requires_human": False,
+                },
+                {
+                    "decision": "manual_inspection",
+                    "reasoning": "需要人工核实质量问题",
+                    "requires_human": True,
+                },
             ],
-            evidence="虚构商家售后SOP 第3.3条"
+            evidence="虚构商家售后SOP 第3.3条",
         )
 
         # return_004: 超期退货申请
@@ -223,13 +289,28 @@ class SOPBuilder:
             title="超期退货申请",
             description="超过7天无理由退货期，不适用无理由退货",
             conditions=[
-                {"field": "days_since_delivery", "operator": "gt", "value": 7, "description": "超过7天"},
-                {"field": "quality_issue", "operator": "eq", "value": False, "description": "非质量问题"},
+                {
+                    "field": "days_since_delivery",
+                    "operator": "gt",
+                    "value": 7,
+                    "description": "超过7天",
+                },
+                {
+                    "field": "quality_issue",
+                    "operator": "eq",
+                    "value": False,
+                    "description": "非质量问题",
+                },
             ],
             decisions=[
-                {"decision": "reject", "reasoning": "超过无理由退货期限", "requires_human": False, "escalation_reasons": ["用户强烈投诉可转人工"]}
+                {
+                    "decision": "reject",
+                    "reasoning": "超过无理由退货期限",
+                    "requires_human": False,
+                    "escalation_reasons": ["用户强烈投诉可转人工"],
+                }
             ],
-            evidence="虚构商家售后SOP 第3.4条"
+            evidence="虚构商家售后SOP 第3.4条",
         )
 
         # === EXCHANGE POLICIES ===
@@ -241,14 +322,29 @@ class SOPBuilder:
             title="换货-颜色或型号",
             description="同款商品可换颜色或型号，需商品完好",
             conditions=[
-                {"field": "days_since_delivery", "operator": "lte", "value": 15, "description": "收货15天内"},
-                {"field": "user_damage", "operator": "eq", "value": False, "description": "无人为损坏"},
-                {"field": "exchange_type", "operator": "in", "value": ["color", "variant"], "description": "换同款颜色或型号"},
+                {
+                    "field": "days_since_delivery",
+                    "operator": "lte",
+                    "value": 15,
+                    "description": "收货15天内",
+                },
+                {
+                    "field": "user_damage",
+                    "operator": "eq",
+                    "value": False,
+                    "description": "无人为损坏",
+                },
+                {
+                    "field": "exchange_type",
+                    "operator": "in",
+                    "value": ["color", "variant"],
+                    "description": "换同款颜色或型号",
+                },
             ],
             decisions=[
                 {"decision": "exchange", "reasoning": "符合换货条件", "requires_human": False}
             ],
-            evidence="虚构商家售后SOP 第4.1条"
+            evidence="虚构商家售后SOP 第4.1条",
         )
 
         # exchange_002: 质量问题换货
@@ -258,13 +354,18 @@ class SOPBuilder:
             title="质量问题换货",
             description="质量问题可申请换货或维修",
             conditions=[
-                {"field": "quality_issue", "operator": "eq", "value": True, "description": "确认质量问题"},
+                {
+                    "field": "quality_issue",
+                    "operator": "eq",
+                    "value": True,
+                    "description": "确认质量问题",
+                },
             ],
             decisions=[
                 {"decision": "exchange", "reasoning": "质量问题换货", "requires_human": False},
-                {"decision": "repair", "reasoning": "如无库存可申请维修", "requires_human": True}
+                {"decision": "repair", "reasoning": "如无库存可申请维修", "requires_human": True},
             ],
-            evidence="虚构商家售后SOP 第4.2条"
+            evidence="虚构商家售后SOP 第4.2条",
         )
 
         # === LOGISTICS POLICIES ===
@@ -276,14 +377,28 @@ class SOPBuilder:
             title="发货时间规定",
             description="现货订单在48h承诺期内未发货，承诺48h内发货",
             conditions=[
-                {"field": "order_type", "operator": "eq", "value": "in_stock", "description": "现货订单"},
+                {
+                    "field": "order_type",
+                    "operator": "eq",
+                    "value": "in_stock",
+                    "description": "现货订单",
+                },
                 {"field": "shipped", "operator": "eq", "value": False, "description": "未发货"},
-                {"field": "days_since_order", "operator": "lte", "value": 2, "description": "距下单 48h 以内"},
+                {
+                    "field": "days_since_order",
+                    "operator": "lte",
+                    "value": 2,
+                    "description": "距下单 48h 以内",
+                },
             ],
             decisions=[
-                {"decision": "ship_within_48h", "reasoning": "现货订单48小时内发货", "requires_human": False}
+                {
+                    "decision": "ship_within_48h",
+                    "reasoning": "现货订单48小时内发货",
+                    "requires_human": False,
+                }
             ],
-            evidence="虚构商家物流SOP 第2.1条"
+            evidence="虚构商家物流SOP 第2.1条",
         )
 
         # logistics_002: 延迟发货处理
@@ -293,14 +408,28 @@ class SOPBuilder:
             title="延迟发货处理",
             description="超过承诺发货时间未发货，可申请赔偿或取消",
             conditions=[
-                {"field": "order_type", "operator": "eq", "value": "in_stock", "description": "现货订单"},
+                {
+                    "field": "order_type",
+                    "operator": "eq",
+                    "value": "in_stock",
+                    "description": "现货订单",
+                },
                 {"field": "shipped", "operator": "eq", "value": False, "description": "未发货"},
-                {"field": "days_since_order", "operator": "gt", "value": 2, "description": "付款超过48小时"},
+                {
+                    "field": "days_since_order",
+                    "operator": "gt",
+                    "value": 2,
+                    "description": "付款超过48小时",
+                },
             ],
             decisions=[
-                {"decision": "cancel_with_compensation", "reasoning": "延迟发货可赔偿或取消", "requires_human": True}
+                {
+                    "decision": "cancel_with_compensation",
+                    "reasoning": "延迟发货可赔偿或取消",
+                    "requires_human": True,
+                }
             ],
-            evidence="虚构商家物流SOP 第2.2条"
+            evidence="虚构商家物流SOP 第2.2条",
         )
 
         # logistics_003: 丢件处理
@@ -310,13 +439,27 @@ class SOPBuilder:
             title="丢件处理",
             description="物流显示签收但用户未收到，可申请退款或补发",
             conditions=[
-                {"field": "logistics_status", "operator": "eq", "value": "signed", "description": "物流显示已签收"},
-                {"field": "user_received", "operator": "eq", "value": False, "description": "用户确认未收到"},
+                {
+                    "field": "logistics_status",
+                    "operator": "eq",
+                    "value": "signed",
+                    "description": "物流显示已签收",
+                },
+                {
+                    "field": "user_received",
+                    "operator": "eq",
+                    "value": False,
+                    "description": "用户确认未收到",
+                },
             ],
             decisions=[
-                {"decision": "resend_or_refund", "reasoning": "丢件可补发或退款", "requires_human": True}
+                {
+                    "decision": "resend_or_refund",
+                    "reasoning": "丢件可补发或退款",
+                    "requires_human": True,
+                }
             ],
-            evidence="虚构商家物流SOP 第2.3条"
+            evidence="虚构商家物流SOP 第2.3条",
         )
 
         # === COUPON/POLICY PROTECTION POLICIES ===
@@ -328,14 +471,33 @@ class SOPBuilder:
             title="价格保护政策",
             description="订单签收后7天内，同款商品降价可申请差价退还",
             conditions=[
-                {"field": "days_since_signed", "operator": "lte", "value": 7, "description": "签收7天内"},
-                {"field": "price_dropped", "operator": "eq", "value": True, "description": "价格确实下降"},
-                {"field": "same_product", "operator": "eq", "value": True, "description": "同款商品"},
+                {
+                    "field": "days_since_signed",
+                    "operator": "lte",
+                    "value": 7,
+                    "description": "签收7天内",
+                },
+                {
+                    "field": "price_dropped",
+                    "operator": "eq",
+                    "value": True,
+                    "description": "价格确实下降",
+                },
+                {
+                    "field": "same_product",
+                    "operator": "eq",
+                    "value": True,
+                    "description": "同款商品",
+                },
             ],
             decisions=[
-                {"decision": "refund_difference", "reasoning": "符合价格保护条件", "requires_human": False}
+                {
+                    "decision": "refund_difference",
+                    "reasoning": "符合价格保护条件",
+                    "requires_human": False,
+                }
             ],
-            evidence="虚构商家优惠SOP 第5.1条"
+            evidence="虚构商家优惠SOP 第5.1条",
         )
 
         # coupon_002: 优惠券使用限制
@@ -345,12 +507,21 @@ class SOPBuilder:
             title="优惠券使用限制",
             description="部分情况不可使用优惠券",
             conditions=[
-                {"field": "order_amount", "operator": "lt", "value": 29, "description": "订单金额低于29元"},
+                {
+                    "field": "order_amount",
+                    "operator": "lt",
+                    "value": 29,
+                    "description": "订单金额低于29元",
+                },
             ],
             decisions=[
-                {"decision": "coupon_not_applicable", "reasoning": "订单金额不满足优惠券使用条件", "requires_human": False}
+                {
+                    "decision": "coupon_not_applicable",
+                    "reasoning": "订单金额不满足优惠券使用条件",
+                    "requires_human": False,
+                }
             ],
-            evidence="虚构商家优惠SOP 第5.2条"
+            evidence="虚构商家优惠SOP 第5.2条",
         )
 
         # === SPECIFICATION POLICIES ===
@@ -362,13 +533,23 @@ class SOPBuilder:
             title="商品兼容性查询",
             description="提供商品兼容性信息，帮助用户确认是否适用",
             conditions=[
-                {"field": "user_asked_compatibility", "operator": "eq", "value": True, "description": "询问兼容性问题"},
-                {"field": "target_device", "operator": "in", "value": ["华为P50", "iPhone 15", "小米14"], "description": "已知设备"},
+                {
+                    "field": "user_asked_compatibility",
+                    "operator": "eq",
+                    "value": True,
+                    "description": "询问兼容性问题",
+                },
+                {
+                    "field": "target_device",
+                    "operator": "in",
+                    "value": ["华为P50", "iPhone 15", "小米14"],
+                    "description": "已知设备",
+                },
             ],
             decisions=[
                 {"decision": "provide_info", "reasoning": "提供兼容性信息", "requires_human": False}
             ],
-            evidence="虚构商家商品SOP 第6.1条"
+            evidence="虚构商家商品SOP 第6.1条",
         )
 
         # === COMPLAINT POLICIES ===
@@ -380,12 +561,21 @@ class SOPBuilder:
             title="服务投诉处理",
             description="用户对服务态度不满，可升级处理",
             conditions=[
-                {"field": "complaint_type", "operator": "eq", "value": "service_attitude", "description": "服务态度投诉"},
+                {
+                    "field": "complaint_type",
+                    "operator": "eq",
+                    "value": "service_attitude",
+                    "description": "服务态度投诉",
+                },
             ],
             decisions=[
-                {"decision": "escalate", "reasoning": "服务投诉需升级主管处理", "requires_human": True}
+                {
+                    "decision": "escalate",
+                    "reasoning": "服务投诉需升级主管处理",
+                    "requires_human": True,
+                }
             ],
-            evidence="虚构商家投诉SOP 第7.1条"
+            evidence="虚构商家投诉SOP 第7.1条",
         )
 
         # complaint_002: 虚假宣传投诉
@@ -395,13 +585,27 @@ class SOPBuilder:
             title="虚假宣传投诉",
             description="如商品描述与实际不符，可退货退款",
             conditions=[
-                {"field": "complaint_type", "operator": "eq", "value": "false_advertising", "description": "虚假宣传投诉"},
-                {"field": "misleading_confirmed", "operator": "eq", "value": True, "description": "确认存在误导"},
+                {
+                    "field": "complaint_type",
+                    "operator": "eq",
+                    "value": "false_advertising",
+                    "description": "虚假宣传投诉",
+                },
+                {
+                    "field": "misleading_confirmed",
+                    "operator": "eq",
+                    "value": True,
+                    "description": "确认存在误导",
+                },
             ],
             decisions=[
-                {"decision": "accept_return_refund", "reasoning": "虚假宣传可退货退款", "requires_human": True}
+                {
+                    "decision": "accept_return_refund",
+                    "reasoning": "虚假宣传可退货退款",
+                    "requires_human": True,
+                }
             ],
-            evidence="虚构商家投诉SOP 第7.2条"
+            evidence="虚构商家投诉SOP 第7.2条",
         )
 
         return self.policies
@@ -409,7 +613,7 @@ class SOPBuilder:
     def save_policies(self, output_path: str):
         """Save policies to JSON file."""
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, 'w', encoding='utf-8') as f:
+        with open(output_path, "w", encoding="utf-8") as f:
             json.dump([p.to_dict() for p in self.policies], f, ensure_ascii=False, indent=2)
 
     def generate_policy_report(self) -> dict:
@@ -418,34 +622,37 @@ class SOPBuilder:
         for p in self.policies:
             if p.category not in by_category:
                 by_category[p.category] = []
-            by_category[p.category].append({
-                "policy_id": p.policy_id,
-                "title": p.title,
-                "requires_human": any(d.requires_human for d in p.decisions)
-            })
+            by_category[p.category].append(
+                {
+                    "policy_id": p.policy_id,
+                    "title": p.title,
+                    "requires_human": any(d.requires_human for d in p.decisions),
+                }
+            )
 
         return {
             "total_policies": len(self.policies),
             "by_category": {k: len(v) for k, v in by_category.items()},
             "policies_requiring_human": sum(
                 1 for p in self.policies if any(d.requires_human for d in p.decisions)
-            )
+            ),
         }
 
 
 def build_sops(output_path: str = "data/processed/fixtures/policies.json"):
     """Build SOPs and save to file."""
-    from datetime import datetime
 
     builder = SOPBuilder()
-    builder.created_at = datetime.now().isoformat()
+    # Use a fixed fixture date so that generated policies are
+    # reproducible across independent processes.
+    builder.created_at = "2026-01-01"
     policies = builder.build_fictional_store_sops()
 
     builder.save_policies(output_path)
 
     report = builder.generate_policy_report()
     print(f"Generated {report['total_policies']} policies:")
-    for category, count in report['by_category'].items():
+    for category, count in report["by_category"].items():
         print(f"  - {category}: {count}")
     print(f"Policies requiring human escalation: {report['policies_requiring_human']}")
 
@@ -454,20 +661,15 @@ def build_sops(output_path: str = "data/processed/fixtures/policies.json"):
 
 def main():
     """CLI entry point."""
-    parser = argparse.ArgumentParser(
-        description="Build SOP policies for fictional 3C store"
-    )
+    parser = argparse.ArgumentParser(description="Build SOP policies for fictional 3C store")
     parser.add_argument(
-        "--output", "-o",
+        "--output",
+        "-o",
         type=str,
         default="data/processed/fixtures/policies.json",
-        help="Output path for policies JSON"
+        help="Output path for policies JSON",
     )
-    parser.add_argument(
-        "--validate",
-        action="store_true",
-        help="Validate policies after building"
-    )
+    parser.add_argument("--validate", action="store_true", help="Validate policies after building")
     parser.add_argument(
         "--registry",
         type=str,
@@ -489,6 +691,7 @@ def main():
     # Validate if requested
     if args.validate:
         from .policy_engine import validate_policy_uniqueness
+
         errors = validate_policy_uniqueness([p.to_dict() for p in policies])
         if errors:
             print("Validation errors:")
@@ -502,7 +705,8 @@ def main():
             import hashlib
 
             from .registry import update_registry_checksum
-            with open(args.output, 'rb') as f:
+
+            with open(args.output, "rb") as f:
                 digest = hashlib.sha256(f.read()).hexdigest()
             update_registry_checksum(
                 args.registry,

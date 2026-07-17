@@ -62,7 +62,7 @@ def validate_pairs_file(path: str) -> dict[str, Any]:
     n_total = 0
     n_valid = 0
     issues: list[dict[str, Any]] = []
-    with open(path, encoding='utf-8') as f:
+    with open(path, encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
@@ -88,23 +88,31 @@ def validate_pairs_file(path: str) -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="DPO trainer (Round 2 placeholder)")
-    parser.add_argument("--check-schema", action="store_true",
-                        help="Print required schema for preference pairs.")
-    parser.add_argument("--validate-data", type=str,
-                        help="Validate a JSONL preference dataset without training.")
+    parser.add_argument(
+        "--check-schema", action="store_true", help="Print required schema for preference pairs."
+    )
+    parser.add_argument(
+        "--validate-data", type=str, help="Validate a JSONL preference dataset without training."
+    )
     args = parser.parse_args()
 
     if args.check_schema:
-        print(json.dumps({
-            "required_keys": list(REQUIRED_KEYS),
-            "optional_keys": ["intent", "annotator", "annotation_date"],
-            "experimental": True,
-            "training_enabled": False,
-            "note": (
-                "DPO training requires a verified human preference dataset. "
-                "Until then this CLI only validates data schema."
-            ),
-        }, ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                {
+                    "required_keys": list(REQUIRED_KEYS),
+                    "optional_keys": ["intent", "annotator", "annotation_date"],
+                    "experimental": True,
+                    "training_enabled": False,
+                    "note": (
+                        "DPO training requires a verified human preference dataset. "
+                        "Until then this CLI only validates data schema."
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return 0
 
     if args.validate_data:

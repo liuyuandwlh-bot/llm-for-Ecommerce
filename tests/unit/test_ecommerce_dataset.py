@@ -1,21 +1,18 @@
 """Unit tests for the E-commerce dataset module."""
 
 import json
-import tempfile
-from pathlib import Path
 
 import pytest
 
 from src.ecommerce.dataset import (
-    SOPBuilder,
-    PolicyEngine,
     CanonicalCaseGenerator,
     ConversationGenerator,
     PipelineConfig,
-    Decision,
+    PolicyEngine,
     SlotSchema,
-    validate_canonical_cases,
+    SOPBuilder,
     run_pipeline,
+    validate_canonical_cases,
 )
 
 
@@ -143,7 +140,7 @@ class TestConversationGenerator:
             roles = [m["role"] for m in c["messages"]]
             assert roles[0] == "system"
             assert roles[-1] == "assistant"
-            for a, b in zip(roles, roles[1:]):
+            for a, b in zip(roles, roles[1:], strict=False):
                 assert a != b
 
     def test_seed_reproducibility(self, tmp_path):
@@ -154,10 +151,12 @@ class TestConversationGenerator:
 
         out1 = tmp_path / "c1.jsonl"
         out2 = tmp_path / "c2.jsonl"
-        cg1 = ConversationGenerator(policies=policies, seed=11,
-                                    mode="fixture", source_id="owned_sop_v1")
-        cg2 = ConversationGenerator(policies=policies, seed=11,
-                                    mode="fixture", source_id="owned_sop_v1")
+        cg1 = ConversationGenerator(
+            policies=policies, seed=11, mode="fixture", source_id="owned_sop_v1"
+        )
+        cg2 = ConversationGenerator(
+            policies=policies, seed=11, mode="fixture", source_id="owned_sop_v1"
+        )
         cg1.run(str(out1), cases=cases)
         cg2.run(str(out2), cases=cases)
         assert out1.read_bytes() == out2.read_bytes()
@@ -171,14 +170,15 @@ class TestDataPipeline:
         cases = [c.to_dict() for c in gen.generate_all()]
 
         policies_path = tmp_path / "policies.json"
-        policies_path.write_text(json.dumps(policies, ensure_ascii=False))
+        policies_path.write_text(json.dumps(policies, ensure_ascii=False), encoding="utf-8")
 
         cases_path = tmp_path / "cases.jsonl"
         gen.save_cases(cases, str(cases_path))
 
         conv_path = tmp_path / "conv.jsonl"
-        ConversationGenerator(policies=policies, seed=42,
-                              mode="fixture", source_id="owned_sop_v1").run(str(conv_path), cases=cases)
+        ConversationGenerator(
+            policies=policies, seed=42, mode="fixture", source_id="owned_sop_v1"
+        ).run(str(conv_path), cases=cases)
 
         registry = {
             "sources": [
@@ -194,7 +194,7 @@ class TestDataPipeline:
             ]
         }
         registry_path = tmp_path / "registry.json"
-        registry_path.write_text(json.dumps(registry, ensure_ascii=False))
+        registry_path.write_text(json.dumps(registry, ensure_ascii=False), encoding="utf-8")
 
         config = PipelineConfig(seed=42, mode="fixture")
         out = tmp_path / "out"

@@ -17,6 +17,7 @@ from typing import Any
 @dataclass
 class Claim:
     """A factual claim in the answer."""
+
     text: str
     doc_id: str
     page: int
@@ -27,6 +28,7 @@ class Claim:
 @dataclass
 class Calculation:
     """A calculation performed."""
+
     formula: str
     operands: list[Any]
     result: Any
@@ -36,6 +38,7 @@ class Calculation:
 @dataclass
 class Answer:
     """A complete answer with citations."""
+
     answer: str
     claims: list[Claim]
     calculations: list[Calculation] = field(default_factory=list)
@@ -50,22 +53,22 @@ class Calculator:
     def extract_numbers(self, text: str) -> list[float]:
         """Extract numbers from text."""
         # Match numbers with optional units
-        pattern = r'([\d,]+\.?\d*)\s*(亿|万|千|%)?'
+        pattern = r"([\d,]+\.?\d*)\s*(亿|万|千|%)?"
         matches = re.findall(pattern, text)
 
         numbers = []
         for num_str, unit in matches:
             try:
-                num = float(num_str.replace(',', ''))
+                num = float(num_str.replace(",", ""))
 
                 # Apply unit multipliers
-                if unit == '亿':
+                if unit == "亿":
                     num *= 1e8
-                elif unit == '万':
+                elif unit == "万":
                     num *= 1e4
-                elif unit == '千':
+                elif unit == "千":
                     num *= 1e3
-                elif unit == '%':
+                elif unit == "%":
                     num /= 100
 
                 numbers.append(num)
@@ -244,19 +247,21 @@ class AnswerEngine:
 
         # Simple claim extraction (in practice, would use NER/extraction model)
         # Look for numerical claims
-        number_pattern = r'([\d,]+\.?\d*)\s*(亿|万|%|元)?'
+        number_pattern = r"([\d,]+\.?\d*)\s*(亿|万|%|元)?"
         matches = re.findall(number_pattern, answer)
 
         for chunk in chunks:
             for num_str, unit in matches:
-                if num_str in chunk.get('text', ''):
-                    claims.append(Claim(
-                        text=f"数值：{num_str}{unit}",
-                        doc_id=chunk.get('doc_id', ''),
-                        page=chunk.get('page_start', 0),
-                        evidence=num_str,
-                        verified=True,
-                    ))
+                if num_str in chunk.get("text", ""):
+                    claims.append(
+                        Claim(
+                            text=f"数值：{num_str}{unit}",
+                            doc_id=chunk.get("doc_id", ""),
+                            page=chunk.get("page_start", 0),
+                            evidence=num_str,
+                            verified=True,
+                        )
+                    )
 
         return claims
 
@@ -266,7 +271,7 @@ class AnswerEngine:
         chunks: list[dict],
     ) -> list[Calculation]:
         """Check if query requires calculations."""
-        calc_keywords = ['增长', '下降', '占比', '同比', '环比', '平均', '总计', '增加', '减少']
+        calc_keywords = ["增长", "下降", "占比", "同比", "环比", "平均", "总计", "增加", "减少"]
 
         if not any(kw in query for kw in calc_keywords):
             return []
@@ -274,7 +279,7 @@ class AnswerEngine:
         # Extract relevant data from chunks
         context = {}
         for chunk in chunks:
-            numbers = self.calculator.extract_numbers(chunk.get('text', ''))
+            numbers = self.calculator.extract_numbers(chunk.get("text", ""))
             if numbers:
                 context[f"doc_{chunk.get('doc_id', '')}"] = numbers[0]
 
@@ -315,8 +320,7 @@ class AnswerEngine:
             return limitations
 
         # Check for chart-only information
-        if any('图' in chunk.get('text', '') or '表' in chunk.get('text', '')
-               for chunk in chunks):
+        if any("图" in chunk.get("text", "") or "表" in chunk.get("text", "") for chunk in chunks):
             limitations.append("部分信息可能仅存在于图表中，需要视觉理解能力")
 
         # Check document recency

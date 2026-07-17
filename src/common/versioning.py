@@ -13,6 +13,7 @@ from pathlib import Path
 @dataclass
 class VersionInfo:
     """Version information for reproducibility."""
+
     data_hash: str
     model_revision: str | None
     code_commit: str
@@ -57,7 +58,7 @@ def compute_data_hash(data_path: str, algorithm: str = "sha256") -> str:
     elif path.is_dir():
         # Hash all files in sorted order for consistency
         for file_path in sorted(path.rglob("*")):
-            if file_path.is_file() and not file_path.name.startswith('.'):
+            if file_path.is_file() and not file_path.name.startswith("."):
                 _hash_file(hasher, file_path)
 
     return hasher.hexdigest()
@@ -68,8 +69,8 @@ def _hash_file(hasher, file_path: Path):
     # Add relative path to hash for uniqueness
     hasher.update(str(file_path).encode())
 
-    with open(file_path, 'rb') as f:
-        for chunk in iter(lambda: f.read(8192), b''):
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
             hasher.update(chunk)
 
 
@@ -81,6 +82,7 @@ def compute_model_hash(model_path: str) -> str:
 def get_git_commit() -> str:
     """Get current git commit SHA."""
     import subprocess
+
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -96,6 +98,7 @@ def get_git_commit() -> str:
 def get_timestamp() -> str:
     """Get current timestamp in ISO format."""
     from datetime import datetime
+
     return datetime.now().isoformat()
 
 

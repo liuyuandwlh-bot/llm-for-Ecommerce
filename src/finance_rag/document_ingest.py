@@ -18,15 +18,12 @@ from typing import Literal
 @dataclass
 class DocumentManifest:
     """Manifest entry for a single document."""
+
     doc_id: str
     company: str
     stock_code: str | None
     report_type: Literal[
-        "annual_report",
-        "half_year_report",
-        "quarterly_report",
-        "policy_document",
-        "other"
+        "annual_report", "half_year_report", "quarterly_report", "policy_document", "other"
     ]
     fiscal_period: str
     published_at: str
@@ -87,8 +84,8 @@ class DocumentIngestor:
     def _compute_sha256(self, file_path: Path) -> str:
         """Compute SHA-256 hash of file."""
         sha256 = hashlib.sha256()
-        with open(file_path, 'rb') as f:
-            for chunk in iter(lambda: f.read(8192), b''):
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
                 sha256.update(chunk)
         return sha256.hexdigest()
 
@@ -134,6 +131,7 @@ class DocumentIngestor:
         page_count = 0
         try:
             import fitz  # type: ignore
+
             with fitz.open(str(file_path)) as doc:
                 page_count = len(doc)
         except Exception:
@@ -164,7 +162,7 @@ class DocumentIngestor:
         """Save manifest to JSON file."""
         manifest_data = [m.to_dict() for m in self.manifest]
 
-        with open(self._manifest_path, 'w', encoding='utf-8') as f:
+        with open(self._manifest_path, "w", encoding="utf-8") as f:
             json.dump(manifest_data, f, ensure_ascii=False, indent=2)
 
         print(f"Manifest saved to: {self._manifest_path}")
@@ -176,7 +174,7 @@ class DocumentIngestor:
             print(f"No manifest found at: {self._manifest_path}")
             return
 
-        with open(self._manifest_path, encoding='utf-8') as f:
+        with open(self._manifest_path, encoding="utf-8") as f:
             manifest_data = json.load(f)
 
         self.manifest = [DocumentManifest.from_dict(m) for m in manifest_data]
@@ -226,11 +224,15 @@ def create_sample_manifest():
 
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser(description="Document ingest manifest helper")
     parser.add_argument("--save-dir", default="data/raw/reports")
-    parser.add_argument("--emit-sample", action="store_true",
-                        help="Print a sample manifest describing how a real "
-                             "ingest run would look; no PDF download happens.")
+    parser.add_argument(
+        "--emit-sample",
+        action="store_true",
+        help="Print a sample manifest describing how a real "
+        "ingest run would look; no PDF download happens.",
+    )
     args = parser.parse_args()
 
     if args.emit_sample:

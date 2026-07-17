@@ -46,8 +46,7 @@ def create_router() -> APIRouter:
         # Validate domain
         if request.domain not in ["ecommerce", "finance"]:
             raise HTTPException(
-                status_code=400,
-                detail="Only 'ecommerce' or 'finance' domain supported"
+                status_code=400, detail="Only 'ecommerce' or 'finance' domain supported"
             )
 
         try:
@@ -89,10 +88,7 @@ def create_router() -> APIRouter:
 
         # Validate domain
         if request.domain != "finance":
-            raise HTTPException(
-                status_code=400,
-                detail="Only 'finance' domain supported"
-            )
+            raise HTTPException(status_code=400, detail="Only 'finance' domain supported")
 
         try:
             # TODO: Call actual RAG pipeline
@@ -114,10 +110,7 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=500, detail=str(e)) from e
 
     @router.post("/api/v1/batch")
-    async def batch_predict(
-        requests: list[CustomerServiceRequest],
-        req: Request
-    ):
+    async def batch_predict(requests: list[CustomerServiceRequest], req: Request):
         """
         Batch prediction endpoint.
 
@@ -125,10 +118,7 @@ def create_router() -> APIRouter:
         """
         # Limit batch size
         if len(requests) > 100:
-            raise HTTPException(
-                status_code=400,
-                detail="Batch size limited to 100 requests"
-            )
+            raise HTTPException(status_code=400, detail="Batch size limited to 100 requests")
 
         responses = []
         for request in requests:

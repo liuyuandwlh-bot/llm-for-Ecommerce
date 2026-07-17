@@ -70,6 +70,7 @@ def create_app() -> FastAPI:
 
     # Include routers
     from src.serving.gateway.router import create_router
+
     app.include_router(create_router())
 
     @app.get("/health", response_model=HealthResponse)
@@ -123,4 +124,5 @@ app = create_app()
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)

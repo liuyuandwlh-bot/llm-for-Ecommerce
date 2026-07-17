@@ -258,13 +258,10 @@ def stratified_group_split(
         "total_samples": len(samples),
         "split_sizes": {k: len(v) for k, v in splits.items()},
         "split_group_counts": {
-            k: sum(1 for s in v for gid in [placed.get(_group_id(s))]
-                   if gid)
+            k: sum(1 for s in v for gid in [placed.get(_group_id(s))] if gid)
             for k, v in splits.items()
         },
-        "split_intent_counts": {
-            k: dict(intent_counts[k]) for k in splits
-        },
+        "split_intent_counts": {k: dict(intent_counts[k]) for k in splits},
     }
     return splits, manifest
 
@@ -281,11 +278,19 @@ def check_leakage(
             gid = _group_id(s)
             cid = s.get("dedup_cluster_id")
             if gid in group_to_split and group_to_split[gid] != split_name:
-                leaks.append({"type": "group", "id": gid, "splits": [group_to_split[gid], split_name]})
+                leaks.append(
+                    {"type": "group", "id": gid, "splits": [group_to_split[gid], split_name]}
+                )
             group_to_split[gid] = split_name
             if cid:
                 if cid in cluster_to_split and cluster_to_split[cid] != split_name:
-                    leaks.append({"type": "dedup_cluster", "id": cid, "splits": [cluster_to_split[cid], split_name]})
+                    leaks.append(
+                        {
+                            "type": "dedup_cluster",
+                            "id": cid,
+                            "splits": [cluster_to_split[cid], split_name],
+                        }
+                    )
                 cluster_to_split[cid] = split_name
     return (len(leaks) == 0, leaks)
 
@@ -313,7 +318,7 @@ def run_pipeline(
     """Run the full data funnel. Returns a structured report dict."""
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    with open(policies_path, encoding='utf-8') as f:
+    with open(policies_path, encoding="utf-8") as f:
         policies = json.load(f)
     engine = PolicyEngine(policies)
 
@@ -333,18 +338,32 @@ def run_pipeline(
     for sample in samples_in:
         err = validate_schema(sample)
         if err:
-            stats.rejections.append({"sample_id": sample.get("sample_id", "<unknown>"), "stage": "schema_pass", "reason": err})
+            stats.rejections.append(
+                {
+                    "sample_id": sample.get("sample_id", "<unknown>"),
+                    "stage": "schema_pass",
+                    "reason": err,
+                }
+            )
             continue
         stats.counts["schema_pass"] += 1
 
         source_id = sample.get("source_id", "")
         entry = registry.get(source_id)
         if entry is None:
-            stats.rejections.append({"sample_id": sample["sample_id"], "stage": "registry_pass", "reason": f"unknown source {source_id!r}"})
+            stats.rejections.append(
+                {
+                    "sample_id": sample["sample_id"],
+                    "stage": "registry_pass",
+                    "reason": f"unknown source {source_id!r}",
+                }
+            )
             continue
         err = validate_sample_against_registry(sample, entry, mode=config.mode)
         if err:
-            stats.rejections.append({"sample_id": sample["sample_id"], "stage": "registry_pass", "reason": err})
+            stats.rejections.append(
+                {"sample_id": sample["sample_id"], "stage": "registry_pass", "reason": err}
+            )
             continue
         stats.counts["registry_pass"] += 1
 
@@ -370,16 +389,37 @@ def run_pipeline(
                 category_hint=sample.get("category_hint"),
             )
             if match.policy_id and match.policy_id not in sample["policy_ids"]:
-                stats.rejections.append({"sample_id": sample["sample_id"], "stage": "policy_pass", "reason": f"policy mismatch with engine: {match.policy_id}", "kind": "policy_inconsistent"})
+                stats.rejections.append(
+                    {
+                        "sample_id": sample["sample_id"],
+                        "stage": "policy_pass",
+                        "reason": f"policy mismatch with engine: {match.policy_id}",
+                        "kind": "policy_inconsistent",
+                    }
+                )
                 continue
             if match.decision.value != sample.get("decision"):
-                stats.rejections.append({"sample_id": sample["sample_id"], "stage": "policy_pass", "reason": f"decision mismatch: engine={match.decision.value} sample={sample.get('decision')}", "kind": "policy_inconsistent"})
+                stats.rejections.append(
+                    {
+                        "sample_id": sample["sample_id"],
+                        "stage": "policy_pass",
+                        "reason": f"decision mismatch: engine={match.decision.value} sample={sample.get('decision')}",
+                        "kind": "policy_inconsistent",
+                    }
+                )
                 continue
         stats.counts["policy_pass"] += 1
 
         err = validate_role_order(sample)
         if err:
-            stats.rejections.append({"sample_id": sample["sample_id"], "stage": "role_pass", "reason": err, "kind": "invalid_roles"})
+            stats.rejections.append(
+                {
+                    "sample_id": sample["sample_id"],
+                    "stage": "role_pass",
+                    "reason": err,
+                    "kind": "invalid_roles",
+                }
+            )
             continue
         stats.counts["role_pass"] += 1
 
@@ -391,14 +431,22 @@ def run_pipeline(
                 quality_ok = False
                 break
         if not quality_ok:
-            stats.rejections.append({"sample_id": sample["sample_id"], "stage": "quality_pass", "reason": "empty content"})
+            stats.rejections.append(
+                {
+                    "sample_id": sample["sample_id"],
+                    "stage": "quality_pass",
+                    "reason": "empty content",
+                }
+            )
             continue
         stats.counts["quality_pass"] += 1
 
         # Review mode gate
         err = validate_review(sample, config.mode)
         if err:
-            stats.rejections.append({"sample_id": sample["sample_id"], "stage": "review_pass", "reason": err})
+            stats.rejections.append(
+                {"sample_id": sample["sample_id"], "stage": "review_pass", "reason": err}
+            )
             continue
         stats.counts["review_pass"] += 1
 
@@ -409,16 +457,19 @@ def run_pipeline(
     survivors: list[dict[str, Any]] = []
     for sample in survived:
         from src.common.near_dedup import normalize_text
+
         text = normalize_text(_user_business_text(sample))
         if not text:
             survivors.append(sample)
             continue
         if text in seen:
-            stats.rejections.append({
-                "sample_id": sample["sample_id"],
-                "stage": "exact_dedup_removed",
-                "reason": f"duplicate of {seen[text]}",
-            })
+            stats.rejections.append(
+                {
+                    "sample_id": sample["sample_id"],
+                    "stage": "exact_dedup_removed",
+                    "reason": f"duplicate of {seen[text]}",
+                }
+            )
             stats.counts["exact_dedup_removed"] += 1
             continue
         seen[text] = sample["sample_id"]
@@ -432,11 +483,15 @@ def run_pipeline(
     kept_for_split: list[dict[str, Any]] = []
     for s in survivors:
         if s["sample_id"] in near_removed_ids or s["sample_id"] in near_quarantined_ids:
-            stats.rejections.append({
-                "sample_id": s["sample_id"],
-                "stage": "near_dedup_removed",
-                "reason": "near_dup_quarantine" if s["sample_id"] in near_quarantined_ids else "near_dup",
-            })
+            stats.rejections.append(
+                {
+                    "sample_id": s["sample_id"],
+                    "stage": "near_dedup_removed",
+                    "reason": "near_dup_quarantine"
+                    if s["sample_id"] in near_quarantined_ids
+                    else "near_dup",
+                }
+            )
             stats.counts["near_dedup_removed"] += 1
             continue
         kept_for_split.append(s)
@@ -455,10 +510,16 @@ def run_pipeline(
     _write_jsonl(Path(output_dir) / "train.jsonl", splits["train"])
     _write_jsonl(Path(output_dir) / "dev.jsonl", splits["dev"])
     _write_jsonl(Path(output_dir) / "test.jsonl", splits["test"])
-    _write_jsonl(Path(output_dir) / "quarantine.jsonl", [
-        {**next((s for s in survivors if s["sample_id"] == item["sample_id"]), item), **{"drop_reason": item.get("reason", "")}}
-        for item in near_result.quarantined
-    ])
+    _write_jsonl(
+        Path(output_dir) / "quarantine.jsonl",
+        [
+            {
+                **next((s for s in survivors if s["sample_id"] == item["sample_id"]), item),
+                **{"drop_reason": item.get("reason", "")},
+            }
+            for item in near_result.quarantined
+        ],
+    )
 
     # Leakage
     leak_ok, leaks = check_leakage(splits)
@@ -467,7 +528,7 @@ def run_pipeline(
         "leak_count": len(leaks),
         "leaks": leaks[:20],  # cap for visibility
     }
-    with open(Path(output_dir) / "leakage_report.json", 'w', encoding='utf-8') as f:
+    with open(Path(output_dir) / "leakage_report.json", "w", encoding="utf-8") as f:
         json.dump(leakage_report, f, ensure_ascii=False, indent=2)
     # Markdown summary
     md_lines = [
@@ -480,7 +541,7 @@ def run_pipeline(
         md_lines.append("\n## Sample leaks (first 20)\n")
         for lk in leaks[:20]:
             md_lines.append(f"- {lk['type']} {lk['id']} spans {lk['splits']}")
-    with open(Path(output_dir) / "leakage_report.md", 'w', encoding='utf-8') as f:
+    with open(Path(output_dir) / "leakage_report.md", "w", encoding="utf-8") as f:
         f.write("\n".join(md_lines) + "\n")
 
     # Manifest
@@ -500,7 +561,7 @@ def run_pipeline(
             for k, v in splits.items()
         },
     }
-    with open(Path(output_dir) / "split_manifest.json", 'w', encoding='utf-8') as f:
+    with open(Path(output_dir) / "split_manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
 
     # Funnel report
@@ -508,14 +569,16 @@ def run_pipeline(
         "stage_counts": stats.counts,
         "rejection_summary": _summary_rejections(stats.rejections),
         "invalid_roles": sum(1 for r in stats.rejections if r.get("kind") == "invalid_roles"),
-        "policy_inconsistent": sum(1 for r in stats.rejections if r.get("kind") == "policy_inconsistent"),
+        "policy_inconsistent": sum(
+            1 for r in stats.rejections if r.get("kind") == "policy_inconsistent"
+        ),
         "near_dedup": near_result.stats,
         "leakage": {"no_leakage": leak_ok, "leak_count": len(leaks)},
         "split_manifest": manifest,
     }
-    with open(Path(output_dir) / "funnel_report.json", 'w', encoding='utf-8') as f:
+    with open(Path(output_dir) / "funnel_report.json", "w", encoding="utf-8") as f:
         json.dump(funnel, f, ensure_ascii=False, indent=2)
-    with open(Path(output_dir) / "funnel_report.md", 'w', encoding='utf-8') as f:
+    with open(Path(output_dir) / "funnel_report.md", "w", encoding="utf-8") as f:
         f.write("# Funnel Report\n\n")
         f.write("## Stage counts\n\n")
         for stage in STAGES:
@@ -533,24 +596,25 @@ def run_pipeline(
 
 def _user_business_text(sample: dict[str, Any]) -> str:
     from src.common.near_dedup import extract_user_business_text
+
     return extract_user_business_text(sample)
 
 
 def _load_jsonl(path: str) -> list[dict[str, Any]]:
-    with open(path, encoding='utf-8') as f:
+    with open(path, encoding="utf-8") as f:
         return [json.loads(line) for line in f]
 
 
 def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
-    with open(path, 'w', encoding='utf-8') as f:
+    with open(path, "w", encoding="utf-8") as f:
         for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + '\n')
+            f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 def _hash_jsonl(path: str) -> str:
     h = hashlib.sha256()
-    with open(path, 'rb') as f:
-        for chunk in iter(lambda: f.read(8192), b''):
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()
 

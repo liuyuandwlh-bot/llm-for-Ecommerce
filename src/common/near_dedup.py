@@ -25,7 +25,9 @@ def normalize_text(text: str) -> str:
     s = unicodedata.normalize("NFKC", str(text))
     s = s.lower()
     s = re.sub(r"[\s\u3000]+", "", s)
-    s = re.sub(r"[，。！？,.!?；;:：、\u201c\u201d\u2018\u2019\"'()\[\]<>《》「」『』\-_/\\|·•]+", "", s)
+    s = re.sub(
+        r"[，。！？,.!?；;:：、\u201c\u201d\u2018\u2019\"'()\[\]<>《》「」『』\-_/\\|·•]+", "", s
+    )
     return s
 
 
@@ -35,7 +37,7 @@ def ngrams(text: str, n: int = _DEFAULT_NGRAM) -> set:
     s = normalize_text(text)
     if len(s) <= n:
         return {s}
-    return {s[i:i + n] for i in range(len(s) - n + 1)}
+    return {s[i : i + n] for i in range(len(s) - n + 1)}
 
 
 def jaccard(a: set, b: set) -> float:
@@ -51,11 +53,7 @@ def jaccard(a: set, b: set) -> float:
 def extract_user_business_text(sample: dict) -> str:
     """Pull only the user turns, joined with a stable separator."""
     messages = sample.get("messages") or []
-    user_texts = [
-        m.get("content", "")
-        for m in messages
-        if m.get("role") == "user"
-    ]
+    user_texts = [m.get("content", "") for m in messages if m.get("role") == "user"]
     if not user_texts:
         return sample.get("user_text") or sample.get("query") or ""
     return "\n".join(user_texts)
@@ -135,14 +133,13 @@ def near_dedup(
 
     for cluster_indices in clusters.values():
         ids_in_cluster = [samples[i]["sample_id"] for i in cluster_indices]
-        cluster_id = build_cluster_id(ids_in_cluster, samples[cluster_indices[0]].get("intent", "unknown"))
+        cluster_id = build_cluster_id(
+            ids_in_cluster, samples[cluster_indices[0]].get("intent", "unknown")
+        )
         cluster_id_map[cluster_id] = ids_in_cluster
 
         decisions = {samples[i].get("decision") for i in cluster_indices}
-        policy_ids = {
-            tuple(sorted(samples[i].get("policy_ids") or []))
-            for i in cluster_indices
-        }
+        policy_ids = {tuple(sorted(samples[i].get("policy_ids") or [])) for i in cluster_indices}
 
         for i in cluster_indices:
             samples[i]["dedup_cluster_id"] = cluster_id
@@ -150,11 +147,13 @@ def near_dedup(
         if len(decisions) > 1 or len(policy_ids) > 1:
             # Label conflict -> quarantine all
             for i in cluster_indices:
-                quarantined.append({
-                    "sample_id": samples[i]["sample_id"],
-                    "reason": "near_dup_label_conflict",
-                    "cluster_id": cluster_id,
-                })
+                quarantined.append(
+                    {
+                        "sample_id": samples[i]["sample_id"],
+                        "reason": "near_dup_label_conflict",
+                        "cluster_id": cluster_id,
+                    }
+                )
             continue
 
         # Stable canonical member: smallest sample_id
@@ -163,12 +162,14 @@ def near_dedup(
         for i in cluster_indices:
             if i == canonical:
                 continue
-            near_removed.append({
-                "sample_id": samples[i]["sample_id"],
-                "kept_sample_id": samples[canonical]["sample_id"],
-                "reason": "near_dup",
-                "cluster_id": cluster_id,
-            })
+            near_removed.append(
+                {
+                    "sample_id": samples[i]["sample_id"],
+                    "kept_sample_id": samples[canonical]["sample_id"],
+                    "reason": "near_dup",
+                    "cluster_id": cluster_id,
+                }
+            )
 
     stats = {
         "input": len(samples),

@@ -56,6 +56,7 @@ def setup_logging(
 def get_logger(name: str):
     """Get a logger instance."""
     import structlog
+
     return structlog.get_logger(name)
 
 
